@@ -42,6 +42,7 @@ model Organization {
   stripeCustomerId     String?       @unique
   stripeSubscriptionId String?       @unique
   billingPeriod        BillingPeriod @default(MONTHLY)
+  currency             String        @default("USD")
   createdAt            DateTime      @default(now())
   updatedAt            DateTime      @updatedAt
 
@@ -146,6 +147,7 @@ model Project {
   organizationId String
   clientId       String?
   name           String
+  description    String?
   color          String   @default("#3730A3")
   icon           String?
   hourlyRate     Decimal  @default(0) @db.Decimal(10, 2)

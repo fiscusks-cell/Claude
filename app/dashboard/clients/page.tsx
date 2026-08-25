@@ -22,18 +22,17 @@ interface FormState {
   currency: string;
 }
 
-const DEFAULT_FORM: FormState = { name: '', email: '', currency: DEFAULT_CURRENCY };
-
 export default function ClientsPage() {
   const { data: session } = useSession();
   const isAdmin = ['OWNER', 'ADMIN'].includes((session?.user as { role?: string })?.role ?? '');
 
+  const [orgCurrency, setOrgCurrency] = useState(DEFAULT_CURRENCY);
   const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(true);
   const [showDialog, setShowDialog] = useState(false);
   const [editClient, setEditClient] = useState<Client | null>(null);
   const dialogMouseDown = useRef(false);
-  const [form, setForm] = useState<FormState>(DEFAULT_FORM);
+  const [form, setForm] = useState<FormState>({ name: '', email: '', currency: DEFAULT_CURRENCY });
   const [saving, setSaving] = useState(false);
 
   const fetchClients = useCallback(async () => {
@@ -46,9 +45,12 @@ export default function ClientsPage() {
     }
   }, []);
 
-  useEffect(() => { fetchClients(); }, [fetchClients]);
+  useEffect(() => {
+    fetchClients();
+    fetch('/api/org').then((r) => r.json()).then((d) => { if (d.currency) setOrgCurrency(d.currency); }).catch(() => {});
+  }, [fetchClients]);
 
-  const openNew = () => { setEditClient(null); setForm(DEFAULT_FORM); setShowDialog(true); };
+  const openNew = () => { setEditClient(null); setForm({ name: '', email: '', currency: orgCurrency }); setShowDialog(true); };
   const openEdit = (c: Client) => { setEditClient(c); setForm({ name: c.name, email: c.email ?? '', currency: c.currency }); setShowDialog(true); };
   const closeDialog = () => { setShowDialog(false); setEditClient(null); };
 

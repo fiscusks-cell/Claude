@@ -9,7 +9,7 @@ interface PeriodEntry {
   durationSeconds: number | null;
   isBillable: boolean;
   user: { name: string };
-  project: { name: string; hourlyRate: any; client?: { name?: string } | null } | null;
+  project: { name: string; hourlyRate: any; client?: { name?: string; currency?: string } | null } | null;
   projectId?: string | null;
 }
 
@@ -25,16 +25,19 @@ interface PeriodData {
 export async function generatePeriodPdf(period: PeriodData, orgName?: string): Promise<Buffer> {
   const resolvedOrgName = orgName ?? period.organization?.name ?? 'ORA';
 
-  const projectMap = new Map<string, { projectName: string; hours: number; rate: number; subtotal: number }>();
+  const projectMap = new Map<string, { projectName: string; currency: string; hours: number; rate: number; subtotal: number }>();
 
   for (const entry of period.entries) {
+    if (!entry.isBillable) continue;
     const key = entry.projectId ?? entry.project?.name ?? '__none__';
     const rate = entry.project ? parseFloat(String(entry.project.hourlyRate)) : 0;
     const hours = (entry.durationSeconds ?? 0) / 3600;
+    const currency = entry.project?.client?.currency ?? 'USD';
 
     if (!projectMap.has(key)) {
       projectMap.set(key, {
         projectName: entry.project?.name ?? 'No Project',
+        currency,
         hours: 0,
         rate,
         subtotal: 0,
@@ -47,8 +50,14 @@ export async function generatePeriodPdf(period: PeriodData, orgName?: string): P
   }
 
   const projectSummaries = Array.from(projectMap.values());
+
+  const currencyMap = new Map<string, number>();
+  for (const p of projectSummaries) {
+    currencyMap.set(p.currency, (currencyMap.get(p.currency) ?? 0) + p.subtotal);
+  }
+  const currencyTotals = [...currencyMap.entries()].map(([currency, amount]) => ({ currency, amount }));
+
   const totalSeconds = period.entries.reduce((s, e) => s + (e.durationSeconds ?? 0), 0);
-  const totalAmount = projectSummaries.reduce((s, p) => s + p.subtotal, 0);
 
   const doc = createElement(PeriodReport, {
     orgName: resolvedOrgName,
@@ -58,7 +67,7 @@ export async function generatePeriodPdf(period: PeriodData, orgName?: string): P
     entries: period.entries as any[],
     projectSummaries,
     totalSeconds,
-    totalAmount,
+    currencyTotals,
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

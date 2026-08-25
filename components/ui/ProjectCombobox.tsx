@@ -18,6 +18,7 @@ interface Props {
   disabled?: boolean;
   placeholder?: string;
   onClose?: () => void;
+  forceOpen?: boolean;
 }
 
 function ProjectRow({
@@ -52,6 +53,7 @@ export function ProjectCombobox({
   disabled = false,
   placeholder = 'Project',
   onClose,
+  forceOpen = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -107,6 +109,10 @@ export function ProjectCombobox({
   useEffect(() => {
     if (open) inputRef.current?.focus();
   }, [open]);
+
+  useEffect(() => {
+    if (forceOpen) openDropdown();
+  }, [forceOpen, openDropdown]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Escape') {

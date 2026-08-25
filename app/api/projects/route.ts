@@ -5,6 +5,7 @@ import { z } from 'zod';
 
 const createSchema = z.object({
   name: z.string().min(1).max(100),
+  description: z.string().max(500).optional(),
   clientId: z.string().optional(),
   color: z.string().default('#3730A3'),
   icon: z.string().min(1),
@@ -56,7 +57,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { name, clientId, color, icon, hourlyRate, isBillable } = parsed.data;
+    const { name, description, clientId, color, icon, hourlyRate, isBillable } = parsed.data;
 
     if (clientId) {
       const client = await prisma.client.findFirst({
@@ -71,6 +72,7 @@ export async function POST(req: NextRequest) {
       data: {
         organizationId,
         name,
+        description: description ?? null,
         clientId: clientId ?? null,
         color,
         icon: icon ?? null,

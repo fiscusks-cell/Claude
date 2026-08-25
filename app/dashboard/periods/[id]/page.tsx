@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import { formatDuration, formatCurrency } from '@/lib/utils';
-import { getCurrency } from '@/lib/currency';
+import { groupCurrencyTotals, formatGroupedAmounts } from '@/lib/currency';
 import { format } from 'date-fns';
 import { CheckCircle, Clock, AlertCircle, Download } from 'lucide-react';
 import { ProjectIconOrDot } from '@/components/ui/ProjectIconOrDot';
@@ -147,7 +147,7 @@ export default function PeriodDetailPage() {
           </div>
           <div>
             <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Billable Amount</div>
-            <div className="text-xl" style={{ color: 'var(--text)' }}>{formatCurrency(totalAmount)}</div>
+            <div className="text-xl" style={{ color: 'var(--text)' }}>{formatGroupedAmounts(groupCurrencyTotals(period.byProject ?? []))}</div>
           </div>
           <div>
             <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Entries</div>
@@ -296,7 +296,7 @@ export default function PeriodDetailPage() {
             <span style={{ color: 'var(--text)' }}>Total</span>
             <div className="flex gap-6">
               <span style={{ color: 'var(--text)' }}>{formatDuration(totalSeconds)}</span>
-              <span style={{ color: 'var(--text)' }}>{formatCurrency(totalAmount)}</span>
+              <span style={{ color: 'var(--text)' }}>{formatGroupedAmounts(groupCurrencyTotals(period.byProject ?? []))}</span>
             </div>
           </div>
         </div>

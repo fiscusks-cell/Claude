@@ -7,11 +7,12 @@ import { CURRENCIES, DEFAULT_CURRENCY, type CurrencyCode } from '@/lib/utils';
 interface Props {
   onCreated: (client: { id: string; name: string; currency: string }) => void;
   onCancel: () => void;
+  defaultCurrency?: string;
 }
 
-export function InlineClientForm({ onCreated, onCancel }: Props) {
+export function InlineClientForm({ onCreated, onCancel, defaultCurrency }: Props) {
   const [name, setName] = useState('');
-  const [currency, setCurrency] = useState<CurrencyCode>(DEFAULT_CURRENCY);
+  const [currency, setCurrency] = useState<CurrencyCode>((defaultCurrency ?? DEFAULT_CURRENCY) as CurrencyCode);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 

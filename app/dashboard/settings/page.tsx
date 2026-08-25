@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { CheckCircle } from 'lucide-react';
 import { SiQuickbooks, SiXero } from 'react-icons/si';
 import { PLANS, type PlanKey } from '@/lib/plans';
+import { CURRENCIES } from '@/lib/currency';
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
 
 type Tab = 'profile' | 'organization' | 'billing' | 'integrations';
@@ -19,6 +20,7 @@ interface OrgInfo {
   name: string;
   plan: PlanKey;
   billingPeriod: string;
+  currency: string;
 }
 
 const card: React.CSSProperties = { background: 'var(--surface)', border: '1px solid var(--border)' };
@@ -41,6 +43,10 @@ export default function SettingsPage() {
   const [weekStartDay, setWeekStartDay] = useState(1);
   const [weekStartSaving, setWeekStartSaving] = useState(false);
 
+  const [orgCurrency, setOrgCurrency] = useState('USD');
+  const [orgCurrencySaving, setOrgCurrencySaving] = useState(false);
+  const [orgCurrencySaved, setOrgCurrencySaved] = useState(false);
+
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -55,7 +61,7 @@ export default function SettingsPage() {
   useEffect(() => {
     fetch('/api/org')
       .then((r) => r.json())
-      .then((d) => setOrg(d))
+      .then((d) => { setOrg(d); if (d.currency) setOrgCurrency(d.currency); })
       .catch(() => {});
   }, []);
 
@@ -174,6 +180,23 @@ export default function SettingsPage() {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
     setSaving(false);
+  };
+
+  const handleSaveOrgCurrency = async () => {
+    setOrgCurrencySaving(true);
+    try {
+      const res = await fetch('/api/org', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currency: orgCurrency }),
+      });
+      if (res.ok) {
+        setOrgCurrencySaved(true);
+        setTimeout(() => setOrgCurrencySaved(false), 2000);
+      }
+    } finally {
+      setOrgCurrencySaving(false);
+    }
   };
 
   const openBillingPortal = async () => {
@@ -382,6 +405,31 @@ export default function SettingsPage() {
               <option value="BIWEEKLY">Bi-weekly</option>
               <option value="MONTHLY">Monthly</option>
             </select>
+          </div>
+          <div>
+            <label className="block text-sm mb-1.5" style={{ color: 'var(--text-muted)' }}>Default currency</label>
+            <p className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>New clients will default to this currency. Existing clients are unaffected.</p>
+            <div className="flex gap-2">
+              <select
+                value={orgCurrency}
+                onChange={(e) => setOrgCurrency(e.target.value)}
+                disabled={orgCurrencySaving}
+                className="flex-1 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
+                style={{ ...inputStyle, color: 'var(--text-secondary)' }}
+              >
+                {CURRENCIES.map((c) => (
+                  <option key={c.code} value={c.code}>{c.label}</option>
+                ))}
+              </select>
+              <button
+                onClick={handleSaveOrgCurrency}
+                disabled={orgCurrencySaving}
+                className="text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50 whitespace-nowrap"
+                style={{ background: 'var(--accent)' }}
+              >
+                {orgCurrencySaved ? '✓ Saved' : orgCurrencySaving ? 'Saving…' : 'Save currency'}
+              </button>
+            </div>
           </div>
           <button
             className="text-white text-sm px-4 py-2 rounded-lg transition-colors"

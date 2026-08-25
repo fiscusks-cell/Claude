@@ -39,7 +39,7 @@ import {
   X,
 } from 'lucide-react';
 import { formatCurrency } from '@/lib/utils';
-import { getCurrency } from '@/lib/currency';
+import { groupCurrencyTotals, formatGroupedAmounts } from '@/lib/currency';
 import { ProjectCombobox } from '@/components/ui/ProjectCombobox';
 import { ProjectIconOrDot } from '@/components/ui/ProjectIconOrDot';
 
@@ -574,9 +574,6 @@ export default function ReportsPage() {
   }
 
   // ── CSV exports ─────────────────────────────────────────────────────────────
-  const defaultCurrency = data?.byProject[0]?.clientCurrency ?? 'USD';
-  void getCurrency(defaultCurrency);
-
   function exportSummaryCSV() {
     if (!data) return;
     const rows: string[][] = [
@@ -879,7 +876,7 @@ export default function ReportsPage() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <StatCard label="Total Hours" value={fmtHours(data.totals.totalSeconds)} />
               <StatCard label="Billable Hours" value={fmtHours(data.totals.billableSeconds)} />
-              <StatCard label="Total Amount" value={formatCurrency(data.totals.totalAmount, defaultCurrency)} />
+              <StatCard label="Total Amount" value={formatGroupedAmounts(groupCurrencyTotals(data.byProject))} />
               <StatCard
                 label="Avg Daily Hours"
                 value={data.totals.activeDays > 0 ? fmtHours(data.totals.totalSeconds / data.totals.activeDays) : '0.0h'}
@@ -1095,7 +1092,7 @@ export default function ReportsPage() {
                     </td>
                     <td className="px-4 py-3 text-right text-slate-400 hidden sm:table-cell">100%</td>
                     <td className="px-4 py-3 text-right text-white">
-                      {formatCurrency(data.totals.totalAmount, defaultCurrency)}
+                      {formatGroupedAmounts(groupCurrencyTotals(data.byProject))}
                     </td>
                   </tr>
                 </tbody>
@@ -1516,7 +1513,7 @@ export default function ReportsPage() {
           {!loading && data && (
             <>
               {(() => {
-                const totalRevenue = profitRows.reduce((s, r) => s + r.billableAmount, 0);
+                const revenueTotals = groupCurrencyTotals(profitRows);
                 const totalSecs = profitRows.reduce((s, r) => s + r.totalSeconds, 0);
                 const billSecs = profitRows.reduce((s, r) => s + r.billableSeconds, 0);
                 const billPct = totalSecs > 0 ? (billSecs / totalSecs) * 100 : 0;
@@ -1553,7 +1550,7 @@ export default function ReportsPage() {
                         Total Revenue
                       </p>
                       <p className="text-2xl text-white">
-                        {formatCurrency(totalRevenue, defaultCurrency)}
+                        {formatGroupedAmounts(revenueTotals)}
                       </p>
                     </div>
                   </div>
@@ -1624,7 +1621,6 @@ export default function ReportsPage() {
                       {(() => {
                         const totalTracked = profitRows.reduce((s, r) => s + r.totalSeconds, 0);
                         const totalBillable = profitRows.reduce((s, r) => s + r.billableSeconds, 0);
-                        const totalRevenue = profitRows.reduce((s, r) => s + r.billableAmount, 0);
                         const overallPct = totalTracked > 0 ? (totalBillable / totalTracked) * 100 : 0;
                         const billColor =
                           overallPct >= 80 ? 'text-emerald-400' : overallPct >= 50 ? 'text-amber-400' : 'text-red-400';
@@ -1642,7 +1638,7 @@ export default function ReportsPage() {
                               {overallPct.toFixed(1)}%
                             </td>
                             <td className="px-4 py-3 text-right text-white">
-                              {formatCurrency(totalRevenue, defaultCurrency)}
+                              {formatGroupedAmounts(groupCurrencyTotals(profitRows))}
                             </td>
                           </tr>
                         );

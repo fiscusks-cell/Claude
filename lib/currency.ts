@@ -52,3 +52,18 @@ export function formatCurrency(amount: number, currency = 'USD'): string {
 export function roundForCurrency(amount: number, currency: string): number {
   return NO_DECIMAL_CURRENCIES.has(currency) ? Math.round(amount) : parseFloat(amount.toFixed(2));
 }
+
+export function groupCurrencyTotals(
+  rows: { clientCurrency: string; billableAmount: number }[],
+): { currency: string; amount: number }[] {
+  const map = new Map<string, number>();
+  for (const r of rows) {
+    map.set(r.clientCurrency, (map.get(r.clientCurrency) ?? 0) + r.billableAmount);
+  }
+  return [...map.entries()].map(([currency, amount]) => ({ currency, amount }));
+}
+
+export function formatGroupedAmounts(totals: { currency: string; amount: number }[]): string {
+  const parts = totals.filter((t) => t.amount > 0).map((t) => formatCurrency(t.amount, t.currency));
+  return parts.length > 0 ? parts.join(' · ') : formatCurrency(0);
+}

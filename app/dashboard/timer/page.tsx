@@ -257,6 +257,8 @@ export default function TimerPage() {
   const [recentDescs, setRecentDescs] = useState<RecentDesc[]>([]);
   const [showDescs, setShowDescs] = useState(false);
   const [openKebab, setOpenKebab] = useState<string | null>(null);
+  const [noProjectError, setNoProjectError] = useState(false);
+  const [openProjectCombobox, setOpenProjectCombobox] = useState(false);
 
   // Entry history
   const [weekStartDay, setWeekStartDay] = useState(1);
@@ -452,6 +454,13 @@ export default function TimerPage() {
     isBillable?: boolean;
   }) => {
     if (loading || isRunning) return;
+    if (!opts && !projectId) {
+      setNoProjectError(true);
+      setOpenProjectCombobox(true);
+      return;
+    }
+    setNoProjectError(false);
+    setOpenProjectCombobox(false);
     setLoading(true);
     try {
       const pid = opts?.projectId !== undefined ? opts.projectId : projectId;
@@ -753,13 +762,14 @@ export default function TimerPage() {
         </div>
 
         {/* ── Project + Tags ─ 25% at sm+ ──────────────────────────────── */}
-        <div className="flex items-center gap-1.5 flex-1 min-w-0 sm:[flex:1_1_0%]">
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 flex-1 min-w-0 sm:[flex:1_1_0%]">
           <ProjectCombobox
             projects={projects}
             value={projectId || null}
-            onChange={(id) => setProjectId(id ?? '')}
+            onChange={(id) => { setProjectId(id ?? ''); setNoProjectError(false); setOpenProjectCombobox(false); }}
             disabled={isRunning}
             placeholder="No project"
+            forceOpen={openProjectCombobox}
           />
           <TagCombobox
             tags={allTags}
@@ -768,6 +778,11 @@ export default function TimerPage() {
             onCreateTag={handleCreateTag}
             disabled={isRunning && !entryId}
           />
+          {noProjectError && (
+            <p className="w-full text-xs" style={{ color: 'var(--error)' }}>
+              Choose a project to start tracking
+            </p>
+          )}
         </div>
 
         {/* ── Controls ─ 25% at sm+ ────────────────────────────────────── */}
