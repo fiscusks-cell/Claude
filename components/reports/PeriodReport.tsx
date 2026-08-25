@@ -1,4 +1,5 @@
 import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer';
+import { formatCurrency } from '@/lib/currency';
 
 const styles = StyleSheet.create({
   page: { padding: 48, fontFamily: 'Helvetica', fontSize: 10, color: '#1e293b' },
@@ -38,6 +39,7 @@ interface Entry {
 
 interface ProjectSummary {
   projectName: string;
+  currency: string;
   hours: number;
   rate: number;
   subtotal: number;
@@ -51,20 +53,24 @@ interface PeriodReportProps {
   entries: Entry[];
   projectSummaries: ProjectSummary[];
   totalSeconds: number;
-  totalAmount: number;
+  currencyTotals: { currency: string; amount: number }[];
 }
 
 export function PeriodReport({
-  orgName, periodStart, periodEnd, status, entries, projectSummaries, totalSeconds, totalAmount
+  orgName, periodStart, periodEnd, status, entries, projectSummaries, totalSeconds, currencyTotals,
 }: PeriodReportProps) {
   const formatDate = (d: Date) => new Date(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   const formatHours = (s: number) => (s / 3600).toFixed(2);
-  const formatMoney = (n: number) => `$${n.toFixed(2)}`;
   const formatDur = (s: number | null) => {
     if (!s) return '—';
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
     return [h, m, sec].map(v => String(v).padStart(2, '0')).join(':');
   };
+
+  const totalAmountText = currencyTotals
+    .filter((t) => t.amount > 0)
+    .map((t) => formatCurrency(t.amount, t.currency))
+    .join(' · ') || formatCurrency(0);
 
   return (
     <Document>
@@ -96,7 +102,9 @@ export function PeriodReport({
           </View>
           <View style={styles.metaItem}>
             <Text style={styles.metaLabel}>Billable Amount</Text>
-            <Text style={[styles.metaValue, { color: '#3730A3' }]}>{formatMoney(totalAmount)}</Text>
+            <Text style={[styles.metaValue, { color: '#3730A3', fontSize: currencyTotals.length > 1 ? 10 : 14 }]}>
+              {totalAmountText}
+            </Text>
           </View>
         </View>
 
@@ -114,13 +122,15 @@ export function PeriodReport({
               <View key={i} style={styles.tableRow}>
                 <Text style={styles.col1}>{p.projectName}</Text>
                 <Text style={styles.col2}>{p.hours.toFixed(2)}h</Text>
-                <Text style={styles.col3}>{formatMoney(p.rate)}/hr</Text>
-                <Text style={styles.col4}>{formatMoney(p.subtotal)}</Text>
+                <Text style={styles.col3}>{formatCurrency(p.rate, p.currency)}/hr</Text>
+                <Text style={styles.col4}>{formatCurrency(p.subtotal, p.currency)}</Text>
               </View>
             ))}
             <View style={styles.totalRow}>
               <Text style={styles.totalLabel}>Total</Text>
-              <Text style={styles.totalValue}>{formatMoney(totalAmount)}</Text>
+              <Text style={[styles.totalValue, { fontSize: currencyTotals.length > 1 ? 9 : 11 }]}>
+                {totalAmountText}
+              </Text>
             </View>
           </View>
         </View>

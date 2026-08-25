@@ -17,6 +17,7 @@ interface Client {
 interface Project {
   id: string;
   name: string;
+  description?: string | null;
   color: string;
   icon?: string | null;
   hourlyRate: number | string;
@@ -27,6 +28,7 @@ interface Project {
 
 interface FormState {
   name: string;
+  description: string;
   clientId: string;
   color: string;
   icon: string;
@@ -35,12 +37,13 @@ interface FormState {
 }
 
 const COLOR_OPTIONS = ['#3730A3', '#10B981', '#EF4444', '#F59E0B', '#8B5CF6', '#06B6D4', '#EC4899', '#64748B'];
-const DEFAULT_FORM: FormState = { name: '', clientId: '', color: '#3730A3', icon: '', hourlyRate: '0', isBillable: true };
+const DEFAULT_FORM: FormState = { name: '', description: '', clientId: '', color: '#3730A3', icon: '', hourlyRate: '0', isBillable: true };
 
 export default function ProjectsPage() {
   const { data: session } = useSession();
   const isAdmin = ['OWNER', 'ADMIN'].includes((session?.user as { role?: string })?.role ?? '');
 
+  const [orgCurrency, setOrgCurrency] = useState('USD');
   const [projects, setProjects] = useState<Project[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [showDialog, setShowDialog] = useState(false);
@@ -55,10 +58,14 @@ export default function ProjectsPage() {
   const fetchProjects = useCallback(async () => { const res = await fetch('/api/projects'); if (res.ok) setProjects(await res.json()); }, []);
   const fetchClients = useCallback(async () => { const res = await fetch('/api/clients'); if (res.ok) setClients(await res.json()); }, []);
 
-  useEffect(() => { fetchProjects(); fetchClients(); }, [fetchProjects, fetchClients]);
+  useEffect(() => {
+    fetchProjects();
+    fetchClients();
+    fetch('/api/org').then((r) => r.json()).then((d) => { if (d.currency) setOrgCurrency(d.currency); }).catch(() => {});
+  }, [fetchProjects, fetchClients]);
 
   const openNew = () => { setEditProject(null); setForm(DEFAULT_FORM); setIconSearch(''); setShowDialog(true); };
-  const openEdit = (p: Project) => { setEditProject(p); setForm({ name: p.name, clientId: p.client?.id ?? '', color: p.color, icon: p.icon ?? '', hourlyRate: String(Number(p.hourlyRate).toFixed(2)), isBillable: p.isBillable }); setIconSearch(''); setShowDialog(true); };
+  const openEdit = (p: Project) => { setEditProject(p); setForm({ name: p.name, description: p.description ?? '', clientId: p.client?.id ?? '', color: p.color, icon: p.icon ?? '', hourlyRate: String(Number(p.hourlyRate).toFixed(2)), isBillable: p.isBillable }); setIconSearch(''); setShowDialog(true); };
   const closeDialog = () => { setShowDialog(false); setEditProject(null); setShowInlineClient(false); setIconSearch(''); };
 
   const handleSubmit = async () => {
@@ -66,7 +73,7 @@ export default function ProjectsPage() {
     if (!editProject && !form.icon) return;
     setSaving(true);
     try {
-      const body = { name: form.name.trim(), color: form.color, icon: form.icon || null, clientId: form.clientId || undefined, hourlyRate: parseFloat(form.hourlyRate) || 0, isBillable: form.isBillable };
+      const body = { name: form.name.trim(), description: form.description.trim() || null, color: form.color, icon: form.icon || null, clientId: form.clientId || undefined, hourlyRate: parseFloat(form.hourlyRate) || 0, isBillable: form.isBillable };
       if (editProject) {
         const res = await fetch(`/api/projects/${editProject.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         if (res.ok) { const updated: Project = await res.json(); setProjects((prev) => prev.map((p) => (p.id === editProject.id ? updated : p))); }
@@ -105,7 +112,12 @@ export default function ProjectsPage() {
               ? <Icon size={28} style={{ color: p.color, width: 28, height: 28, flexShrink: 0 }} />
               : <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: p.color }} />
             }
-            <span className="font-medium" style={{ color: 'var(--text)' }}>{p.name}</span>
+            <div>
+              <span className="font-medium" style={{ color: 'var(--text)' }}>{p.name}</span>
+              {p.description && (
+                <p className="text-xs mt-0.5 line-clamp-1" style={{ color: 'var(--text-muted)' }}>{p.description}</p>
+              )}
+            </div>
           </div>
         );
       },
@@ -186,6 +198,18 @@ export default function ProjectsPage() {
                 <input type="text" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} className="w-full rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2" style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', color: 'var(--text)', '--tw-ring-color': 'var(--accent)' } as React.CSSProperties} placeholder="e.g. Website Redesign" autoFocus />
               </div>
               <div>
+                <label className="block text-sm mb-1.5" style={{ color: 'var(--text-secondary)' }}>Description <span className="text-xs" style={{ color: 'var(--text-muted)' }}>(optional)</span></label>
+                <textarea
+                  value={form.description}
+                  onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+                  rows={2}
+                  maxLength={500}
+                  className="w-full rounded-lg px-3 py-2.5 text-sm resize-none focus:outline-none focus:ring-2"
+                  style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', color: 'var(--text)', '--tw-ring-color': 'var(--accent)' } as React.CSSProperties}
+                  placeholder="What is this project about?"
+                />
+              </div>
+              <div>
                 <label className="block text-sm mb-1.5" style={{ color: 'var(--text-secondary)' }}>Client</label>
                 <select value={form.clientId} onChange={(e) => setForm((f) => ({ ...f, clientId: e.target.value }))} className="w-full rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2" style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', color: 'var(--text-secondary)', '--tw-ring-color': 'var(--accent)' } as React.CSSProperties}>
                   <option value="">No client</option>
@@ -205,6 +229,7 @@ export default function ProjectsPage() {
                 ) : (
                   <div className="mt-2">
                     <InlineClientForm
+                      defaultCurrency={orgCurrency}
                       onCreated={(client) => {
                         setClients((prev) => [{ ...client, email: null, qboCustomerId: null, xeroContactId: null } as Client, ...prev]);
                         setForm((f) => ({ ...f, clientId: client.id }));
