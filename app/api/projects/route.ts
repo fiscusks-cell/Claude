@@ -5,7 +5,7 @@ import { z } from 'zod';
 
 const createSchema = z.object({
   name: z.string().min(1).max(100),
-  description: z.string().max(500).optional(),
+  description: z.string().max(500).nullable().optional(),
   clientId: z.string().optional(),
   color: z.string().default('#3730A3'),
   icon: z.string().min(1),
