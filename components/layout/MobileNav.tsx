@@ -23,9 +23,11 @@ export function MobileNav({ user }: MobileNavProps) {
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <button
-          className="flex items-center justify-center w-9 h-9 rounded-lg transition-colors hover:bg-white/10"
+          className="flex items-center justify-center w-9 h-9 rounded-lg transition-colors"
           style={{ color: 'var(--sidebar-text)' }}
           aria-label="Open navigation menu"
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--sidebar-item-hover)'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = ''; }}
         >
           <Menu className="h-5 w-5" />
         </button>
