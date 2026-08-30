@@ -5,10 +5,9 @@ import { usePathname } from 'next/navigation';
 import { signOut } from 'next-auth/react';
 import {
   LayoutDashboard, Clock, FolderKanban, Building2,
-  BarChart3, Users, Settings, PieChart, FileText, Sun, Moon, Plug, LogOut,
+  BarChart3, Users, Settings, PieChart, FileText, Sun, Moon, Plug, LogOut, ChevronDown,
 } from 'lucide-react';
 import { SiQuickbooks, SiXero } from 'react-icons/si';
-import { cn } from '@/lib/utils';
 import { useTheme } from '@/components/ThemeProvider';
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
 import { useTimerStore } from '@/store/timerStore';
@@ -44,6 +43,13 @@ const adminItems: NavItem[] = [
   { href: '/dashboard/team', label: 'Team', icon: Users },
 ];
 
+function hoverOn(e: React.MouseEvent<HTMLElement>) {
+  (e.currentTarget as HTMLElement).style.background = 'var(--sidebar-item-hover)';
+}
+function hoverOff(e: React.MouseEvent<HTMLElement>) {
+  (e.currentTarget as HTMLElement).style.background = '';
+}
+
 export function DashboardNav({ user }: DashboardNavProps) {
   const pathname = usePathname();
   const { theme, toggle } = useTheme();
@@ -52,6 +58,8 @@ export function DashboardNav({ user }: DashboardNavProps) {
   const isRunning = useTimerStore((s) => s.isRunning);
   const storeStartedAt = useTimerStore((s) => s.startedAt);
   const [timerLabel, setTimerLabel] = useState('Time Tracker');
+  const [analyzeOpen, setAnalyzeOpen] = useState(true);
+  const [manageOpen, setManageOpen] = useState(true);
 
   useEffect(() => {
     if (!isRunning || !storeStartedAt) {
@@ -83,14 +91,13 @@ export function DashboardNav({ user }: DashboardNavProps) {
       <Link
         key={href}
         href={href}
-        className={cn(
-          'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
-          !active && 'hover:bg-white/5',
-        )}
+        className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors"
         style={{
-          boxShadow: active ? 'inset 3px 0 0 var(--accent)' : undefined,
+          background: active ? 'var(--sidebar-item-active)' : undefined,
           color: active ? 'var(--sidebar-text)' : 'var(--sidebar-muted)',
         }}
+        onMouseEnter={(e) => { if (!active) hoverOn(e); }}
+        onMouseLeave={(e) => { if (!active) hoverOff(e); }}
       >
         <Icon size={18} />
         {label}
@@ -101,21 +108,20 @@ export function DashboardNav({ user }: DashboardNavProps) {
   return (
     <div className="flex flex-col h-full">
       <nav className="flex-1 px-3 py-4">
-        {/* Timer — label shows live elapsed time when a timer is running */}
-        <div className="space-y-1">
+        {/* Timer — label shows live elapsed time when running */}
+        <div className="space-y-1 mb-1">
           {(() => {
             const active = isActive('/dashboard/timer');
             return (
               <Link
                 href="/dashboard/timer"
-                className={cn(
-                  'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
-                  !active && 'hover:bg-white/5',
-                )}
+                className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors"
                 style={{
-                  boxShadow: active ? 'inset 3px 0 0 var(--accent)' : undefined,
+                  background: active ? 'var(--sidebar-item-active)' : undefined,
                   color: active ? 'var(--sidebar-text)' : 'var(--sidebar-muted)',
                 }}
+                onMouseEnter={(e) => { if (!active) hoverOn(e); }}
+                onMouseLeave={(e) => { if (!active) hoverOff(e); }}
               >
                 <Clock size={18} />
                 {timerLabel}
@@ -124,25 +130,47 @@ export function DashboardNav({ user }: DashboardNavProps) {
           })()}
         </div>
 
+        <div style={{ borderTop: '1px solid var(--sidebar-border)', margin: '4px 4px 0' }} />
+
         {/* Analyze */}
-        <p
-          className="px-3 pt-6 pb-1 text-[10px] uppercase tracking-[0.1em]"
+        <button
+          type="button"
+          onClick={() => setAnalyzeOpen((v) => !v)}
+          aria-expanded={analyzeOpen}
+          className="flex items-center justify-between w-full px-3 pt-4 pb-1 text-[10px] uppercase tracking-[0.1em] transition-opacity hover:opacity-75"
           style={{ color: 'var(--sidebar-muted)' }}
         >
           Analyze
-        </p>
-        <div className="space-y-1">{analyzeItems.map(navLink)}</div>
+          <ChevronDown
+            size={11}
+            className="transition-transform duration-200"
+            style={{ transform: analyzeOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }}
+          />
+        </button>
+        {analyzeOpen && <div className="space-y-1">{analyzeItems.map(navLink)}</div>}
+
+        <div style={{ borderTop: '1px solid var(--sidebar-border)', margin: '8px 4px 0' }} />
 
         {/* Manage */}
-        <p
-          className="px-3 pt-6 pb-1 text-[10px] uppercase tracking-[0.1em]"
+        <button
+          type="button"
+          onClick={() => setManageOpen((v) => !v)}
+          aria-expanded={manageOpen}
+          className="flex items-center justify-between w-full px-3 pt-4 pb-1 text-[10px] uppercase tracking-[0.1em] transition-opacity hover:opacity-75"
           style={{ color: 'var(--sidebar-muted)' }}
         >
           Manage
-        </p>
-        <div className="space-y-1">
-          {[...manageItems, ...(isAdmin ? adminItems : [])].map(navLink)}
-        </div>
+          <ChevronDown
+            size={11}
+            className="transition-transform duration-200"
+            style={{ transform: manageOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }}
+          />
+        </button>
+        {manageOpen && (
+          <div className="space-y-1">
+            {[...manageItems, ...(isAdmin ? adminItems : [])].map(navLink)}
+          </div>
+        )}
       </nav>
 
       <div className="px-3 py-3 space-y-1" style={{ borderTop: '1px solid var(--sidebar-border)' }}>
@@ -153,14 +181,13 @@ export function DashboardNav({ user }: DashboardNavProps) {
           return (
             <Link
               href="/dashboard/settings"
-              className={cn(
-                'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
-                !active && 'hover:bg-white/5',
-              )}
+              className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors"
               style={{
-                boxShadow: active ? 'inset 3px 0 0 var(--accent)' : undefined,
+                background: active ? 'var(--sidebar-item-active)' : undefined,
                 color: active ? 'var(--sidebar-text)' : 'var(--sidebar-muted)',
               }}
+              onMouseEnter={(e) => { if (!active) hoverOn(e); }}
+              onMouseLeave={(e) => { if (!active) hoverOff(e); }}
             >
               <Settings size={18} />
               Settings
@@ -174,14 +201,13 @@ export function DashboardNav({ user }: DashboardNavProps) {
           return (
             <Link
               href="/dashboard/settings?tab=integrations"
-              className={cn(
-                'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
-                !active && 'hover:bg-white/5',
-              )}
+              className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors"
               style={{
-                boxShadow: active ? 'inset 3px 0 0 var(--accent)' : undefined,
+                background: active ? 'var(--sidebar-item-active)' : undefined,
                 color: active ? 'var(--sidebar-text)' : 'var(--sidebar-muted)',
               }}
+              onMouseEnter={(e) => { if (!active) hoverOn(e); }}
+              onMouseLeave={(e) => { if (!active) hoverOff(e); }}
             >
               <Plug size={18} />
               <span className="flex-1">Integrations</span>
@@ -195,9 +221,12 @@ export function DashboardNav({ user }: DashboardNavProps) {
 
         {/* Theme toggle */}
         <button
+          type="button"
           onClick={toggle}
-          className="flex items-center gap-3 w-full px-3 py-2 rounded-lg text-sm transition-colors hover:bg-white/5"
+          className="flex items-center gap-3 w-full px-3 py-2 rounded-lg text-sm transition-colors"
           style={{ color: 'var(--sidebar-muted)' }}
+          onMouseEnter={hoverOn}
+          onMouseLeave={hoverOff}
         >
           {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
           {theme === 'dark' ? 'Light mode' : 'Dark mode'}
@@ -225,9 +254,12 @@ export function DashboardNav({ user }: DashboardNavProps) {
         </div>
 
         <button
+          type="button"
           onClick={() => signOut({ callbackUrl: '/auth/signin' })}
-          className="flex items-center gap-2 w-full px-3 py-2 text-sm rounded-lg transition-colors hover:bg-white/5"
+          className="flex items-center gap-2 w-full px-3 py-2 text-sm rounded-lg transition-colors"
           style={{ color: 'var(--sidebar-muted)' }}
+          onMouseEnter={hoverOn}
+          onMouseLeave={hoverOff}
         >
           <LogOut className="w-4 h-4" />
           Sign out

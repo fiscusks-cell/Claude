@@ -56,9 +56,10 @@ function sumSeconds(entries: TimeEntryLite[] | undefined): number {
 }
 
 function formatHM(totalSeconds: number): string {
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  const totalMinutes = Math.round(totalSeconds / 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return `${h}:${String(m).padStart(2, '0')}`;
 }
 
 function calcBillableAmount(entries: TimeEntryLite[] | undefined): number {

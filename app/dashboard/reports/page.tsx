@@ -173,7 +173,10 @@ const LS_KEY = 'ora-saved-reports';
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fmtHours(seconds: number) {
-  return (seconds / 3600).toFixed(1) + 'h';
+  const totalMinutes = Math.round(seconds / 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return `${h}:${String(m).padStart(2, '0')}`;
 }
 
 function fmtHoursChart(seconds: number) {
@@ -1458,13 +1461,12 @@ export default function ReportsPage() {
                           {workloadDays.map((day) => {
                             const key = format(day, 'yyyy-MM-dd');
                             const secs = userMap?.get(key) ?? 0;
-                            const h = secs / 3600;
                             return (
                               <td key={key} className="px-1 py-2 text-center">
                                 <div
                                   className={`mx-auto rounded-md flex items-center justify-center h-8 w-14 ${workloadCellClass(secs)}`}
                                 >
-                                  {h > 0 ? `${h.toFixed(1)}h` : '—'}
+                                  {secs > 0 ? fmtHours(secs) : '—'}
                                 </div>
                               </td>
                             );

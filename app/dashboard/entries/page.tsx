@@ -28,9 +28,10 @@ interface Entry {
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 function fmtHM(s: number): string {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return `${h}h ${m}m`;
+  const totalMinutes = Math.round(s / 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return `${h}:${String(m).padStart(2, '0')}`;
 }
 
 function fmtTime(iso: string): string {
