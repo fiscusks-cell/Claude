@@ -282,6 +282,10 @@ export default function ReportsPage() {
   const [saveReportName, setSaveReportName] = useState('');
   const saveInputRef = useRef<HTMLInputElement>(null);
 
+  // PDF export state
+  const [orgName, setOrgName] = useState('');
+  const [pdfGenerating, setPdfGenerating] = useState(false);
+
   // ── Load saved reports ──────────────────────────────────────────────────────
   useEffect(() => {
     try {
@@ -373,6 +377,14 @@ export default function ReportsPage() {
       .then((r) => r.json())
       .then((d: TeamMember[]) => setTeamMembers(d))
       .catch(console.error);
+  }, []);
+
+  // ── Fetch org name (for PDF footer) ─────────────────────────────────────────
+  useEffect(() => {
+    fetch('/api/org')
+      .then((r) => r.json())
+      .then((d: { name?: string }) => setOrgName(d.name ?? ''))
+      .catch(() => {});
   }, []);
 
   // ── Derived filter options ──────────────────────────────────────────────────
@@ -577,6 +589,41 @@ export default function ReportsPage() {
   }
 
   // ── CSV exports ─────────────────────────────────────────────────────────────
+  async function exportReportPDF() {
+    if (!data) return;
+    setPdfGenerating(true);
+    try {
+      const [{ pdf }, { ReportPDF }] = await Promise.all([
+        import('@react-pdf/renderer'),
+        import('@/components/reports/ReportPDF'),
+      ]);
+      const element = React.createElement(ReportPDF, {
+        orgName: orgName || 'Ora',
+        dateRange,
+        entries: data.entries,
+        byDay: data.byDay,
+        byProject: data.byProject,
+        totals: {
+          totalSeconds: data.totals.totalSeconds,
+          billableSeconds: data.totals.billableSeconds,
+          activeDays: data.totals.activeDays,
+        },
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const blob = await pdf(element as any).toBlob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ora-report-${dateRange.start || 'custom'}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('PDF generation failed:', err);
+    } finally {
+      setPdfGenerating(false);
+    }
+  }
+
   function exportSummaryCSV() {
     if (!data) return;
     const rows: string[][] = [
@@ -751,14 +798,24 @@ export default function ReportsPage() {
             </button>
           )}
           {(activeTab === 'summary' || activeTab === 'detailed') && (
-            <button
-              onClick={activeTab === 'summary' ? exportSummaryCSV : exportDetailedCSV}
-              disabled={!data || data.entries.length === 0}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg border border-slate-700 transition-colors"
-            >
-              <Download size={15} />
-              Export CSV
-            </button>
+            <>
+              <button
+                onClick={exportReportPDF}
+                disabled={!data || data.entries.length === 0 || pdfGenerating}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg border border-slate-700 transition-colors"
+              >
+                <Download size={15} />
+                {pdfGenerating ? 'Generating…' : 'Export PDF'}
+              </button>
+              <button
+                onClick={activeTab === 'summary' ? exportSummaryCSV : exportDetailedCSV}
+                disabled={!data || data.entries.length === 0}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg border border-slate-700 transition-colors"
+              >
+                <Download size={15} />
+                Export CSV
+              </button>
+            </>
           )}
         </div>
       </div>
