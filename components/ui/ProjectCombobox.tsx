@@ -72,8 +72,13 @@ export function ProjectCombobox({
 
   const selected = projects.find((p) => p.id === value) ?? null;
 
-  const filtered = query.trim()
-    ? projects.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()))
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? projects.filter(
+        (p) =>
+          p.name.toLowerCase().includes(q) ||
+          (p.clientName?.toLowerCase().includes(q) ?? false),
+      )
     : projects;
 
   const openDropdown = useCallback(() => {
@@ -190,7 +195,7 @@ export function ProjectCombobox({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Search projects…"
+              placeholder="Search projects or clients…"
               className="w-full text-sm px-3 py-1.5 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
               style={{
                 background: 'var(--surface-raised)',
@@ -222,19 +227,12 @@ export function ProjectCombobox({
               <li className="px-3 py-4 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
                 No matches
               </li>
-            ) : query.trim() ? (
-              // Flat list while searching — headers add noise mid-search
-              filtered.map((p) => (
-                <li key={p.id}>
-                  <ProjectRow p={p} selected={value === p.id} onSelect={select} />
-                </li>
-              ))
             ) : (
-              // Grouped by client when not searching
+              // Grouped by client — always. Collapse state ignored while searching so results are always visible.
               (() => {
                 const groups = new Map<string, ProjectOption[]>();
                 const noClient: ProjectOption[] = [];
-                for (const p of projects) {
+                for (const p of filtered) {
                   if (p.clientName) {
                     const existing = groups.get(p.clientName) ?? [];
                     existing.push(p);
@@ -249,12 +247,12 @@ export function ProjectCombobox({
                   ...(noClient.length > 0 ? [{ label: 'No client', items: noClient }] : []),
                 ];
                 return sections.map(({ label, items }) => {
-                  const collapsed = collapsedClients.has(label);
+                  const collapsed = !q && collapsedClients.has(label);
                   return (
                     <li key={label}>
                       <button
                         type="button"
-                        onClick={() => toggleClient(label)}
+                        onClick={() => { if (!q) toggleClient(label); }}
                         className="w-full flex items-center gap-1 px-3 pt-3 pb-1 hover:opacity-80 transition-opacity"
                       >
                         {collapsed

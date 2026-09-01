@@ -81,6 +81,25 @@ function formatHM(seconds: number): string {
   return `${h}:${String(m).padStart(2, '0')}`;
 }
 
+function formatHMS(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function parseDuration(s: string): number | null {
+  const parts = s.trim().split(':');
+  if (parts.length < 2 || parts.length > 3) return null;
+  const nums = parts.map((p) => parseInt(p, 10));
+  if (nums.some((n) => isNaN(n) || n < 0)) return null;
+  const [h, m, sec = 0] = nums;
+  if (m > 59 || sec > 59) return null;
+  const total = h * 3600 + m * 60 + sec;
+  if (total <= 0) return null;
+  return total;
+}
+
 function formatTime(dateStr: string): string {
   return format(new Date(dateStr), 'h:mma');
 }
@@ -283,17 +302,20 @@ export default function TimerPage() {
   const editMouseDown = useRef(false);
 
   // Inline editing — one field open at a time across all rows
-  type InlineField = 'description' | 'project' | 'tags' | 'startTime' | 'endTime';
+  type InlineField = 'description' | 'project' | 'tags' | 'startTime' | 'endTime' | 'duration';
   const [inlineEdit, setInlineEdit] = useState<{ entryId: string; field: InlineField } | null>(null);
   const [inlineDesc, setInlineDesc] = useState('');
   const [inlineProjectId, setInlineProjectId] = useState<string | null>(null);
   const [inlineTagIds, setInlineTagIds] = useState<string[]>([]);
   const [inlineStartTime, setInlineStartTime] = useState('');
   const [inlineEndTime, setInlineEndTime] = useState('');
+  const [inlineDuration, setInlineDuration] = useState('');
+  const [durationInvalid, setDurationInvalid] = useState(false);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const descriptionRef = useRef<HTMLInputElement>(null);
   const descSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recentDescsCachedRef = useRef(false);
 
   // Populate edit form when a new entry is opened for editing
   useEffect(() => {
@@ -399,16 +421,18 @@ export default function TimerPage() {
     async function init() {
       let wsd = 1;
       try {
-        const r = await fetch('/api/user/preferences');
-        const d = await r.json();
+        const [prefRes] = await Promise.all([
+          fetch('/api/user/preferences'),
+          fetchProjects(),
+          fetchTags(),
+          checkActiveTimer(),
+        ]);
+        const d = await prefRes.json();
         if (typeof d.weekStartDay === 'number') wsd = d.weekStartDay;
       } catch { /* use default */ }
       if (!mounted) return;
       setWeekStartDay(wsd);
       await loadInitialWeeks(wsd);
-      fetchProjects();
-      fetchTags();
-      checkActiveTimer();
     }
     init();
     return () => { mounted = false; };
@@ -498,7 +522,7 @@ export default function TimerPage() {
     setLoading(true);
     try {
       const now = new Date();
-      await fetch(`/api/time-entries/${entryId}`, {
+      const res = await fetch(`/api/time-entries/${entryId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stoppedAt: now.toISOString(), tagIds: selectedTagIds }),
@@ -511,11 +535,15 @@ export default function TimerPage() {
       setProjectId('');
       setSelectedTagIds([]);
       useTimerStore.getState().stopTimer();
-      await refreshCurrentWeeks();
+      if (res.ok) {
+        const stopped = await res.json() as TimeEntry;
+        setWeeks((prev) => insertEntryIntoWeeks(prev, stopped, weekStartDay));
+      }
+      recentDescsCachedRef.current = false;
     } finally {
       setLoading(false);
     }
-  }, [entryId, loading, isRunning, selectedTagIds, refreshCurrentWeeks]);
+  }, [entryId, loading, isRunning, selectedTagIds, weekStartDay]);
 
   const handlePlay = useCallback((entry: TimeEntry) => {
     setSelectedTagIds(entry.tags.map((t) => t.id));
@@ -661,6 +689,10 @@ export default function TimerPage() {
   // ── recent descriptions dropdown ──────────────────────────────────────────
 
   const handleDescFocus = async () => {
+    if (recentDescsCachedRef.current) {
+      if (recentDescs.length > 0) setShowDescs(true);
+      return;
+    }
     const res = await fetch('/api/time-entries');
     if (!res.ok) return;
     const entries: TimeEntry[] = await res.json();
@@ -677,6 +709,7 @@ export default function TimerPage() {
         });
       }
     }
+    recentDescsCachedRef.current = true;
     setRecentDescs(unique);
     if (unique.length > 0) setShowDescs(true);
   };
@@ -1100,10 +1133,58 @@ export default function TimerPage() {
                                   )}
                                 </span>
 
-                                {/* Duration */}
-                                <span className="text-sm tabular-nums flex-shrink-0" style={{ color: 'var(--text)' }}>
-                                  {formatHM(isMulti && !isExpanded ? groupTotal : seconds)}
-                                </span>
+                                {/* Duration — group total is read-only; individual entries are click-to-edit */}
+                                {(isMulti && !isExpanded) ? (
+                                  <span className="text-sm tabular-nums flex-shrink-0" style={{ color: 'var(--text)' }}>
+                                    {formatHM(groupTotal)}
+                                  </span>
+                                ) : inlineEdit?.entryId === entry.id && inlineEdit.field === 'duration' ? (
+                                  <input
+                                    type="text"
+                                    autoFocus
+                                    className="w-20 text-sm tabular-nums rounded px-1 py-0.5 flex-shrink-0 focus:outline-none"
+                                    style={{
+                                      background: 'var(--surface-raised)',
+                                      border: `1px solid ${durationInvalid ? 'var(--error)' : 'var(--accent)'}`,
+                                      color: 'var(--text)',
+                                    }}
+                                    value={inlineDuration}
+                                    onChange={(e) => { setInlineDuration(e.target.value); setDurationInvalid(false); }}
+                                    onBlur={() => {
+                                      const parsed = parseDuration(inlineDuration);
+                                      setInlineEdit(null);
+                                      setDurationInvalid(false);
+                                      if (parsed !== null) {
+                                        const newStoppedAt = new Date(new Date(entry.startedAt).getTime() + parsed * 1000).toISOString();
+                                        saveInlineField(entry, { stoppedAt: newStoppedAt });
+                                      }
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        const parsed = parseDuration(inlineDuration);
+                                        if (parsed !== null) {
+                                          const newStoppedAt = new Date(new Date(entry.startedAt).getTime() + parsed * 1000).toISOString();
+                                          setInlineEdit(null);
+                                          setDurationInvalid(false);
+                                          saveInlineField(entry, { stoppedAt: newStoppedAt });
+                                        } else {
+                                          setDurationInvalid(true);
+                                        }
+                                      }
+                                      if (e.key === 'Escape') { e.stopPropagation(); setInlineEdit(null); setDurationInvalid(false); }
+                                      if (e.key === ' ') e.stopPropagation();
+                                    }}
+                                  />
+                                ) : (
+                                  <span
+                                    className="text-sm tabular-nums flex-shrink-0 cursor-text rounded-sm px-0.5 -mx-0.5 hover:bg-white/5 transition-colors"
+                                    style={{ color: 'var(--text)' }}
+                                    onClick={() => { setOpenKebab(null); setInlineEdit({ entryId: entry.id, field: 'duration' }); setInlineDuration(formatHMS(seconds)); setDurationInvalid(false); }}
+                                    title="Click to edit duration"
+                                  >
+                                    {formatHM(seconds)}
+                                  </span>
+                                )}
 
                                 {/* Play */}
                                 <button
