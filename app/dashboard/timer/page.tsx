@@ -316,6 +316,7 @@ export default function TimerPage() {
   const descriptionRef = useRef<HTMLInputElement>(null);
   const descSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recentDescsCachedRef = useRef(false);
+  const hideDescTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Populate edit form when a new entry is opened for editing
   useEffect(() => {
@@ -479,6 +480,7 @@ export default function TimerPage() {
     isBillable?: boolean;
   }) => {
     if (loading || isRunning) return;
+    // Project guard fires before anything is set
     if (!opts && !projectId) {
       setNoProjectError(true);
       setOpenProjectCombobox(true);
@@ -487,11 +489,21 @@ export default function TimerPage() {
     setNoProjectError(false);
     setOpenProjectCombobox(false);
     setLoading(true);
+
+    const pid = opts?.projectId !== undefined ? opts.projectId : projectId;
+    const desc = opts?.description !== undefined ? opts.description : description;
+    const billable = opts?.isBillable !== undefined ? opts.isBillable : isBillable;
+    const now = new Date();
+
+    // Optimistic: start the counter immediately so it doesn't freeze during the round trip
+    setStartedAt(now);
+    setIsRunning(true);
+    setElapsed(0);
+    if (opts?.projectId !== undefined) setProjectId(opts.projectId);
+    if (opts?.description !== undefined) setDescription(opts.description);
+    if (opts?.isBillable !== undefined) setIsBillable(opts.isBillable);
+
     try {
-      const pid = opts?.projectId !== undefined ? opts.projectId : projectId;
-      const desc = opts?.description !== undefined ? opts.description : description;
-      const billable = opts?.isBillable !== undefined ? opts.isBillable : isBillable;
-      const now = new Date();
       const res = await fetch('/api/time-entries', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -502,16 +514,24 @@ export default function TimerPage() {
           isBillable: billable,
         }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        setIsRunning(false);
+        setStartedAt(null);
+        setElapsed(0);
+        return;
+      }
       const entry: TimeEntry = await res.json();
       setEntryId(entry.id);
-      setStartedAt(now);
-      setIsRunning(true);
-      setElapsed(0);
+      // Reconcile to server's startedAt if clock skew is meaningful (>2 s)
+      const serverStart = new Date(entry.startedAt);
+      if (Math.abs(serverStart.getTime() - now.getTime()) > 2000) {
+        setStartedAt(serverStart);
+      }
       useTimerStore.getState().startTimer(entry.id, pid ?? null, desc ?? '');
-      if (opts?.projectId !== undefined) setProjectId(opts.projectId);
-      if (opts?.description !== undefined) setDescription(opts.description);
-      if (opts?.isBillable !== undefined) setIsBillable(opts.isBillable);
+    } catch {
+      setIsRunning(false);
+      setStartedAt(null);
+      setElapsed(0);
     } finally {
       setLoading(false);
     }
@@ -758,8 +778,11 @@ export default function TimerPage() {
             placeholder="What are you working on?"
             value={description}
             onChange={(e) => handleDescriptionChange(e.target.value)}
-            onFocus={handleDescFocus}
-            onBlur={() => setTimeout(() => setShowDescs(false), 150)}
+            onFocus={() => {
+              if (hideDescTimer.current) { clearTimeout(hideDescTimer.current); hideDescTimer.current = null; }
+              handleDescFocus();
+            }}
+            onBlur={() => { hideDescTimer.current = setTimeout(() => setShowDescs(false), 150); }}
             className="w-full bg-transparent text-sm focus:outline-none"
             style={{ color: 'var(--text)' }}
           />
@@ -1190,13 +1213,13 @@ export default function TimerPage() {
                                 <button
                                   onClick={() => handlePlay(entry)}
                                   disabled={isRunning || loading}
-                                  className="opacity-0 group-hover:opacity-100 flex-shrink-0 transition-opacity disabled:cursor-not-allowed"
+                                  className="opacity-0 group-hover:opacity-100 flex-shrink-0 p-1 -m-1 transition-opacity disabled:cursor-not-allowed"
                                   style={{ color: 'var(--text-muted)' }}
                                   onMouseEnter={(e) => { if (!isRunning && !loading) e.currentTarget.style.color = 'var(--accent)'; }}
                                   onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
                                   aria-label="Restart this entry"
                                 >
-                                  <Play className="w-4 h-4" />
+                                  <Play className="w-5 h-5" />
                                 </button>
 
                                 {/* Kebab */}
