@@ -111,6 +111,7 @@ interface TeamMember {
   name: string | null;
   email: string;
   role: string;
+  kind?: string;
 }
 
 interface ProjectOption {
@@ -261,6 +262,8 @@ export default function ReportsPage() {
   const [loading, setLoading] = useState(false);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
+  const [allClients, setAllClients] = useState<{ id: string; name: string }[]>([]);
+  const [allFilterProjects, setAllFilterProjects] = useState<{ id: string; name: string; isArchived: boolean }[]>([]);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
 
   // Detailed tab state
@@ -353,29 +356,31 @@ export default function ReportsPage() {
       .then((r) => r.json())
       .then((d: ReportData) => {
         setData(d);
-        const projMap = new Map<string, ProjectOption>();
-        for (const entry of d.entries) {
-          if (entry.project) {
-            projMap.set(entry.project.id, {
-              id: entry.project.id,
-              name: entry.project.name,
-              color: entry.project.color,
-              icon: entry.project.icon ?? null,
-              clientName: entry.project.client?.name ?? null,
-            });
-          }
-        }
-        setProjects(Array.from(projMap.values()));
       })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [dateRange, filters]);
 
-  // ── Fetch team members ──────────────────────────────────────────────────────
+  // ── Fetch org-scoped filter options (once on mount, independent of report filters) ──
   useEffect(() => {
-    fetch('/api/team')
-      .then((r) => r.json())
-      .then((d: TeamMember[]) => setTeamMembers(d))
+    Promise.all([
+      fetch('/api/team').then((r) => (r.ok ? r.json() : [])),
+      fetch('/api/clients').then((r) => (r.ok ? r.json() : [])),
+      fetch('/api/projects?includeArchived=true').then((r) => (r.ok ? r.json() : [])),
+    ])
+      .then(([team, clients, rawProjects]) => {
+        setTeamMembers(team as TeamMember[]);
+        setAllClients((clients as { id: string; name: string }[]).map(({ id, name }) => ({ id, name })));
+        const rp = rawProjects as {
+          id: string; name: string; color: string; icon?: string | null;
+          isArchived: boolean; client?: { name: string } | null;
+        }[];
+        setAllFilterProjects(rp.map((p) => ({ id: p.id, name: p.name, isArchived: p.isArchived })));
+        setProjects(rp.map((p) => ({
+          id: p.id, name: p.name, color: p.color,
+          icon: p.icon ?? null, clientName: p.client?.name ?? null,
+        })));
+      })
       .catch(console.error);
   }, []);
 
@@ -387,23 +392,6 @@ export default function ReportsPage() {
       .catch(() => {});
   }, []);
 
-  // ── Derived filter options ──────────────────────────────────────────────────
-  const { clients, filterProjects, members } = useMemo(() => {
-    if (!data) return { clients: [], filterProjects: [], members: [] };
-    const clientMap = new Map<string, string>();
-    const projectMap = new Map<string, string>();
-    const memberMap = new Map<string, string>();
-    for (const entry of data.entries) {
-      if (entry.project?.client) clientMap.set(entry.project.client.id, entry.project.client.name);
-      if (entry.project) projectMap.set(entry.project.id, entry.project.name);
-      memberMap.set(entry.user.id, entry.user.name ?? 'Unknown');
-    }
-    return {
-      clients: Array.from(clientMap.entries()).map(([id, name]) => ({ id, name })),
-      filterProjects: Array.from(projectMap.entries()).map(([id, name]) => ({ id, name })),
-      members: Array.from(memberMap.entries()).map(([id, name]) => ({ id, name })),
-    };
-  }, [data]);
 
   // ── Bar chart data ──────────────────────────────────────────────────────────
   const barData = useMemo(() => {
@@ -735,7 +723,7 @@ export default function ReportsPage() {
             className={SELECT_CLS}
           >
             <option value="">All Clients</option>
-            {clients.map((c) => (
+            {allClients.map((c) => (
               <option key={c.id} value={c.id}>{c.name}</option>
             ))}
           </select>
@@ -747,8 +735,8 @@ export default function ReportsPage() {
             className={SELECT_CLS}
           >
             <option value="">All Projects</option>
-            {filterProjects.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
+            {allFilterProjects.map((p) => (
+              <option key={p.id} value={p.id}>{p.isArchived ? `${p.name} (archived)` : p.name}</option>
             ))}
           </select>
         )}
@@ -759,8 +747,8 @@ export default function ReportsPage() {
             className={SELECT_CLS}
           >
             <option value="">All Members</option>
-            {members.map((m) => (
-              <option key={m.id} value={m.id}>{m.name}</option>
+            {teamMembers.filter((m) => m.kind === 'member').map((m) => (
+              <option key={m.id} value={m.id}>{m.name ?? m.email}</option>
             ))}
           </select>
         )}
