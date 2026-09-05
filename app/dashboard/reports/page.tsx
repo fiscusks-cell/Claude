@@ -264,6 +264,10 @@ export default function ReportsPage() {
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [allClients, setAllClients] = useState<{ id: string; name: string }[]>([]);
   const [allFilterProjects, setAllFilterProjects] = useState<{ id: string; name: string; isArchived: boolean }[]>([]);
+  const [projectDetails, setProjectDetails] = useState<
+    Record<string, NonNullable<TimeEntry['project']>>
+  >({});
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
 
   // Detailed tab state
@@ -340,26 +344,70 @@ export default function ReportsPage() {
   }, [preset, customStart, customEnd]);
 
   // ── Fetch reports ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!dateRange.start || !dateRange.end) return;
-    const params = new URLSearchParams({
-      startDate: dateRange.start,
-      endDate: dateRange.end + 'T23:59:59',
-    });
-    if (filters.clientId) params.set('clientId', filters.clientId);
-    if (filters.projectId) params.set('projectId', filters.projectId);
-    if (filters.userId) params.set('userId', filters.userId);
-    if (filters.billable) params.set('billable', filters.billable);
+  // byDay / byProject / totals are aggregated server-side, so this request is the only
+  // thing that can bring them back in step after an entry changes.
+  const reportSeq = useRef(0);
+  const activeLoads = useRef(0);
+  const pendingEdits = useRef(new Map<string, Partial<TimeEntry>>());
 
-    setLoading(true);
-    fetch(`/api/reports?${params}`)
-      .then((r) => r.json())
-      .then((d: ReportData) => {
-        setData(d);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, [dateRange, filters]);
+  // An in-flight edit is re-applied over a freshly fetched list, so a response issued
+  // before that edit landed can't visibly undo the user's own change.
+  const applyPendingEdits = useCallback((d: ReportData): ReportData => {
+    if (pendingEdits.current.size === 0) return d;
+    return {
+      ...d,
+      entries: d.entries.map((e) => {
+        const patch = pendingEdits.current.get(e.id);
+        return patch ? { ...e, ...patch } : e;
+      }),
+    };
+  }, []);
+
+  const fetchReport = useCallback(
+    async ({ silent = false }: { silent?: boolean } = {}): Promise<boolean> => {
+      if (!dateRange.start || !dateRange.end) return false;
+      const params = new URLSearchParams({
+        startDate: dateRange.start,
+        endDate: dateRange.end + 'T23:59:59',
+      });
+      if (filters.clientId) params.set('clientId', filters.clientId);
+      if (filters.projectId) params.set('projectId', filters.projectId);
+      if (filters.userId) params.set('userId', filters.userId);
+      if (filters.billable) params.set('billable', filters.billable);
+
+      const seq = ++reportSeq.current;
+      if (!silent) {
+        activeLoads.current += 1;
+        setLoading(true);
+      }
+      try {
+        const res = await fetch(`/api/reports?${params}`);
+        if (!res.ok) throw new Error(`Reports request failed: ${res.status}`);
+        const d = (await res.json()) as ReportData;
+        // Superseded while in flight — dropping it stops a slow earlier response from
+        // overwriting newer data.
+        if (seq !== reportSeq.current) return true;
+        setData(applyPendingEdits(d));
+        setRefreshError(null);
+        return true;
+      } catch (err) {
+        console.error(err);
+        // Only the newest request reports failure; a superseded one is not the
+        // caller's answer.
+        return seq !== reportSeq.current;
+      } finally {
+        if (!silent) {
+          activeLoads.current -= 1;
+          if (activeLoads.current === 0) setLoading(false);
+        }
+      }
+    },
+    [dateRange, filters, applyPendingEdits],
+  );
+
+  useEffect(() => {
+    void fetchReport();
+  }, [fetchReport]);
 
   // ── Fetch org-scoped filter options (once on mount, independent of report filters) ──
   useEffect(() => {
@@ -373,13 +421,27 @@ export default function ReportsPage() {
         setAllClients((clients as { id: string; name: string }[]).map(({ id, name }) => ({ id, name })));
         const rp = rawProjects as {
           id: string; name: string; color: string; icon?: string | null;
-          isArchived: boolean; client?: { name: string } | null;
+          hourlyRate: string | number; isBillable: boolean; isArchived: boolean;
+          client?: { id: string; name: string; currency: string } | null;
         }[];
         setAllFilterProjects(rp.map((p) => ({ id: p.id, name: p.name, isArchived: p.isArchived })));
         setProjects(rp.map((p) => ({
           id: p.id, name: p.name, color: p.color,
           icon: p.icon ?? null, clientName: p.client?.name ?? null,
         })));
+        // Full project shape for inline edits. The PATCH response's project include
+        // omits icon and client currency, so reconcile against this rather than it.
+        setProjectDetails(
+          Object.fromEntries(
+            rp.map((p) => [
+              p.id,
+              {
+                id: p.id, name: p.name, color: p.color, icon: p.icon ?? null,
+                hourlyRate: p.hourlyRate, isBillable: p.isBillable, client: p.client ?? null,
+              },
+            ]),
+          ),
+        );
       })
       .catch(console.error);
   }, []);
@@ -518,51 +580,146 @@ export default function ReportsPage() {
     setEditValue('');
   }
 
+  const patchEntry = useCallback((entryId: string, patch: Partial<TimeEntry>) => {
+    setData((prev) =>
+      prev
+        ? { ...prev, entries: prev.entries.map((e) => (e.id === entryId ? { ...e, ...patch } : e)) }
+        : prev,
+    );
+  }, []);
+
+  const resolveProject = useCallback(
+    (projectId: string | null | undefined): TimeEntry['project'] =>
+      projectId ? projectDetails[projectId] ?? null : null,
+    [projectDetails],
+  );
+
+  // The PATCH body plus the matching local patch, so the row shows the new value before
+  // the round trip finishes. Duration mirrors the server's own recalculation.
+  function buildEditPatch(
+    entry: TimeEntry,
+    field: NonNullable<EditingCell>['field'],
+    value: string,
+  ): { body: Record<string, unknown>; optimistic: Partial<TimeEntry> } | null {
+    const secondsBetween = (startedAt: string, stoppedAt: string) =>
+      Math.max(
+        0,
+        Math.round((new Date(stoppedAt).getTime() - new Date(startedAt).getTime()) / 1000),
+      );
+    const atTime = (base: string, hhmm: string): string | null => {
+      const [h, m] = hhmm.split(':').map(Number);
+      if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+      const d = new Date(base);
+      d.setHours(h, m, 0, 0);
+      return d.toISOString();
+    };
+
+    switch (field) {
+      case 'description':
+        return { body: { description: value }, optimistic: { description: value } };
+      case 'projectId': {
+        const projectId = value || null;
+        return {
+          body: { projectId },
+          optimistic: { projectId, project: resolveProject(projectId) },
+        };
+      }
+      case 'startedAt': {
+        const startedAt = atTime(entry.startedAt, value);
+        if (!startedAt) return null;
+        return {
+          body: { startedAt },
+          optimistic: {
+            startedAt,
+            durationSeconds: entry.stoppedAt ? secondsBetween(startedAt, entry.stoppedAt) : null,
+          },
+        };
+      }
+      case 'stoppedAt': {
+        if (!entry.stoppedAt) return null;
+        const stoppedAt = atTime(entry.stoppedAt, value);
+        if (!stoppedAt) return null;
+        return {
+          body: { stoppedAt },
+          optimistic: { stoppedAt, durationSeconds: secondsBetween(entry.startedAt, stoppedAt) },
+        };
+      }
+      case 'duration': {
+        const parts = value.split(':');
+        const totalSecs = (parseInt(parts[0]) || 0) * 3600 + (parseInt(parts[1] || '0') || 0) * 60;
+        const stoppedAt = new Date(
+          new Date(entry.startedAt).getTime() + totalSecs * 1000,
+        ).toISOString();
+        return { body: { stoppedAt }, optimistic: { stoppedAt, durationSeconds: totalSecs } };
+      }
+      case 'isBillable': {
+        const isBillable = value === 'true';
+        return { body: { isBillable }, optimistic: { isBillable } };
+      }
+    }
+  }
+
   async function commitEditValue(
     entry: TimeEntry,
     field: NonNullable<EditingCell>['field'],
     value: string,
   ) {
+    const patch = buildEditPatch(entry, field, value);
+    if (!patch) return;
+
+    // Rollback snapshot: every field an inline edit can touch.
+    const before: Partial<TimeEntry> = {
+      description: entry.description,
+      projectId: entry.projectId,
+      project: entry.project,
+      startedAt: entry.startedAt,
+      stoppedAt: entry.stoppedAt,
+      durationSeconds: entry.durationSeconds,
+      isBillable: entry.isBillable,
+    };
+
     setRowStates((prev) => ({ ...prev, [entry.id]: 'saving' }));
-    let body: Record<string, unknown> = {};
-    if (field === 'description') {
-      body = { description: value };
-    } else if (field === 'projectId') {
-      body = { projectId: value || null };
-    } else if (field === 'startedAt') {
-      const d = new Date(entry.startedAt);
-      const [h, m] = value.split(':').map(Number);
-      d.setHours(h, m, 0, 0);
-      body = { startedAt: d.toISOString() };
-    } else if (field === 'stoppedAt' && entry.stoppedAt) {
-      const d = new Date(entry.stoppedAt);
-      const [h, m] = value.split(':').map(Number);
-      d.setHours(h, m, 0, 0);
-      body = { stoppedAt: d.toISOString() };
-    } else if (field === 'duration') {
-      const parts = value.split(':');
-      const totalSecs = (parseInt(parts[0]) || 0) * 3600 + (parseInt(parts[1] || '0') || 0) * 60;
-      const newStop = new Date(new Date(entry.startedAt).getTime() + totalSecs * 1000);
-      body = { stoppedAt: newStop.toISOString() };
-    } else if (field === 'isBillable') {
-      body = { isBillable: value === 'true' };
-    }
+    pendingEdits.current.set(entry.id, patch.optimistic);
+    patchEntry(entry.id, patch.optimistic);
+
     try {
       const res = await fetch(`/api/time-entries/${entry.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(patch.body),
       });
-      if (!res.ok) throw new Error();
-      const updated = (await res.json()) as Partial<TimeEntry>;
-      setData((prev) =>
-        prev
-          ? { ...prev, entries: prev.entries.map((e) => (e.id === entry.id ? { ...e, ...updated } : e)) }
-          : prev,
-      );
+      if (!res.ok) throw new Error(`Save failed: ${res.status}`);
+      const updated = (await res.json()) as TimeEntry;
+
+      const reconciled: Partial<TimeEntry> = {
+        description: updated.description,
+        projectId: updated.projectId,
+        project: resolveProject(updated.projectId) ?? updated.project,
+        startedAt: updated.startedAt,
+        stoppedAt: updated.stoppedAt,
+        durationSeconds: updated.durationSeconds,
+        isBillable: updated.isBillable,
+      };
+      pendingEdits.current.set(entry.id, reconciled);
+      patchEntry(entry.id, reconciled);
       setRowStates((prev) => ({ ...prev, [entry.id]: 'saved' }));
       setTimeout(() => setRowStates((prev) => ({ ...prev, [entry.id]: 'idle' })), 1500);
-    } catch {
+
+      // Re-run the report so the aggregates match the entry list again.
+      const refreshed = await fetchReport({ silent: true });
+      pendingEdits.current.delete(entry.id);
+      if (!refreshed) {
+        // A patched entry beside stale aggregates is the bug this exists to remove, so
+        // put the row back and say the report is out of date.
+        patchEntry(entry.id, before);
+        setRefreshError(
+          'Your change was saved, but the report could not be refreshed — the figures shown are out of date.',
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      pendingEdits.current.delete(entry.id);
+      patchEntry(entry.id, before);
       setRowStates((prev) => ({ ...prev, [entry.id]: 'error' }));
       setTimeout(() => setRowStates((prev) => ({ ...prev, [entry.id]: 'idle' })), 2000);
     }
@@ -807,6 +964,19 @@ export default function ReportsPage() {
           )}
         </div>
       </div>
+
+      {/* Stale-report warning: the edit landed, the refresh didn't */}
+      {refreshError && (
+        <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg border border-amber-800/60 bg-amber-950/40 text-sm text-amber-200">
+          <span>{refreshError}</span>
+          <button
+            onClick={() => void fetchReport()}
+            className="px-3 py-1 rounded-md border border-amber-700/70 text-amber-100 hover:bg-amber-900/40 transition-colors whitespace-nowrap"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Save report modal */}
       {showSaveModal && (
