@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
-import { roundForCurrency } from '@/lib/currency';
+import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
 
 export async function GET(req: NextRequest) {
   const authz = await requireAuth();
@@ -91,13 +91,16 @@ export async function GET(req: NextRequest) {
   }
   const byDay = Array.from(dayMap.entries()).map(([date, v]) => ({ date, ...v }));
 
-  // byProject aggregation
+  // byProject aggregation.
+  // Money is rounded exactly once, per entry, into integer minor units; every
+  // aggregate above is a pure integer sum of those, so project rows, client
+  // rows and the report total all reconcile with each other and with invoices.
   type MemberAgg = {
     userId: string;
     userName: string;
     totalSeconds: number;
     billableSeconds: number;
-    billableAmount: number;
+    billableAmountMinor: number;
   };
   type ProjectAgg = {
     projectId: string | null;
@@ -109,7 +112,7 @@ export async function GET(req: NextRequest) {
     clientCurrency: string;
     totalSeconds: number;
     billableSeconds: number;
-    billableAmount: number;
+    billableAmountMinor: number;
     members: Map<string, MemberAgg>;
   };
 
@@ -118,11 +121,9 @@ export async function GET(req: NextRequest) {
   for (const entry of entries) {
     const key = entry.projectId ?? '__no_project__';
     const secs = entry.durationSeconds ?? 0;
-    const hourlyRate = entry.project ? Number(entry.project.hourlyRate) : 0;
+    const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
     const currency = entry.project?.client?.currency ?? 'USD';
-    const amount = entry.isBillable
-      ? roundForCurrency(hourlyRate * (secs / 3600), currency)
-      : 0;
+    const entryMinor = entry.isBillable ? amountMinor(secs, rateHundredths, currency) : 0;
 
     if (!projectMap.has(key)) {
       projectMap.set(key, {
@@ -135,7 +136,7 @@ export async function GET(req: NextRequest) {
         clientCurrency: currency,
         totalSeconds: 0,
         billableSeconds: 0,
-        billableAmount: 0,
+        billableAmountMinor: 0,
         members: new Map(),
       });
     }
@@ -144,7 +145,7 @@ export async function GET(req: NextRequest) {
     agg.totalSeconds += secs;
     if (entry.isBillable) {
       agg.billableSeconds += secs;
-      agg.billableAmount += amount;
+      agg.billableAmountMinor += entryMinor;
     }
 
     const memberId = entry.userId;
@@ -154,14 +155,14 @@ export async function GET(req: NextRequest) {
         userName: entry.user.name ?? 'Unknown',
         totalSeconds: 0,
         billableSeconds: 0,
-        billableAmount: 0,
+        billableAmountMinor: 0,
       });
     }
     const member = agg.members.get(memberId)!;
     member.totalSeconds += secs;
     if (entry.isBillable) {
       member.billableSeconds += secs;
-      member.billableAmount += amount;
+      member.billableAmountMinor += entryMinor;
     }
   }
 
@@ -175,8 +176,13 @@ export async function GET(req: NextRequest) {
     clientCurrency: p.clientCurrency,
     totalSeconds: p.totalSeconds,
     billableSeconds: p.billableSeconds,
-    billableAmount: p.billableAmount,
-    members: Array.from(p.members.values()),
+    billableAmountMinor: p.billableAmountMinor,
+    // Major-unit convenience value, derived from the integer sum — display only.
+    billableAmount: fromMinor(p.billableAmountMinor, p.clientCurrency),
+    members: Array.from(p.members.values()).map((m) => ({
+      ...m,
+      billableAmount: fromMinor(m.billableAmountMinor, p.clientCurrency),
+    })),
   }));
 
   const totals = {
@@ -184,6 +190,7 @@ export async function GET(req: NextRequest) {
     billableSeconds: entries
       .filter((e) => e.isBillable)
       .reduce((s, e) => s + (e.durationSeconds ?? 0), 0),
+    // Legacy: a cross-currency sum, only meaningful for single-currency reports.
     totalAmount: byProject.reduce((s, p) => s + p.billableAmount, 0),
     activeDays: dayMap.size,
   };

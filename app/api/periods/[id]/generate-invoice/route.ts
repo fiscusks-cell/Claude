@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
-import { getCurrency, roundForCurrency, formatCurrency } from '@/lib/currency';
+import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
 import { generateInvoicePdf } from '@/lib/invoice-pdf';
 import { format, addDays } from 'date-fns';
 
@@ -44,36 +44,6 @@ export async function POST(
     });
     const invoiceNumber = `INV-${String(invoiceCount + 1).padStart(4, '0')}`;
 
-    // ── group entries by project ─────────────────────────────────────────────
-
-    type LineGroup = {
-      projectName: string;
-      totalHours: number;
-      hourlyRate: number;
-      amount: number;
-    };
-
-    const byProject = new Map<string, LineGroup>();
-
-    for (const entry of period.entries) {
-      const key = entry.projectId ?? '__no_project__';
-      const rate = entry.project ? parseFloat(entry.project.hourlyRate.toString()) : 0;
-      const hours = (entry.durationSeconds ?? 0) / 3600;
-
-      if (!byProject.has(key)) {
-        byProject.set(key, {
-          projectName: entry.project?.name ?? 'Time',
-          totalHours: 0,
-          hourlyRate: rate,
-          amount: 0,
-        });
-      }
-
-      const g = byProject.get(key)!;
-      g.totalHours += hours;
-      g.amount += hours * rate;
-    }
-
     // ── resolve client and currency ──────────────────────────────────────────
 
     let billTo = { name: 'Unknown Client', email: '' };
@@ -90,19 +60,69 @@ export async function POST(
       }
     }
 
-    // ── build line items and totals ──────────────────────────────────────────
+    // ── group entries by project ─────────────────────────────────────────────
+    // Money is rounded once per time entry into integer minor units — the same
+    // leaf the Reports aggregation uses — so the invoice total reconciles
+    // exactly with the report for the same entries.
 
-    const lineItems = Array.from(byProject.values()).map((g) => ({
+    type LineGroup = {
+      projectName: string;
+      seconds: number;
+      rateHundredths: number;
+      amountMinor: number; // Σ per-entry minor units
+    };
+
+    const byProject = new Map<string, LineGroup>();
+
+    for (const entry of period.entries) {
+      const key = entry.projectId ?? '__no_project__';
+      const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
+      const secs = entry.durationSeconds ?? 0;
+
+      if (!byProject.has(key)) {
+        byProject.set(key, {
+          projectName: entry.project?.name ?? 'Time',
+          seconds: 0,
+          rateHundredths,
+          amountMinor: 0,
+        });
+      }
+
+      const g = byProject.get(key)!;
+      g.seconds += secs;
+      g.amountMinor += amountMinor(secs, rateHundredths, currency);
+    }
+
+    // ── build line items and totals ──────────────────────────────────────────
+    // Each product line foots against its own hours × rate (hours never rounded
+    // before the multiply; printed at the precision that makes the arithmetic
+    // check out). Per-entry rounding can leave the sum of those a few minor
+    // units away from the report total, so the difference is disclosed as an
+    // explicit rounding-adjustment line instead of being hidden in a line.
+
+    const groups = Array.from(byProject.values());
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, currency);
+
+    const lineItems = groups.map((g) => ({
       description: g.projectName,
-      hours: parseFloat(g.totalHours.toFixed(2)),
-      rate: roundForCurrency(g.hourlyRate, currency),
-      amount: roundForCurrency(g.amount, currency),
+      hours: parseFloat((g.seconds / 3600).toFixed(6)),
+      rate: g.rateHundredths / 100,
+      amount: fromMinor(lineFootMinor(g), currency),
     }));
 
-    const subtotal = roundForCurrency(
-      lineItems.reduce((sum, item) => sum + item.amount, 0),
-      currency,
-    );
+    const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
+    const linesMinor = groups.reduce((s, g) => s + lineFootMinor(g), 0);
+    const adjMinor = reportMinor - linesMinor;
+    if (adjMinor !== 0) {
+      lineItems.push({
+        description: 'Rounding adjustment',
+        hours: 0,
+        rate: 0,
+        amount: fromMinor(adjMinor, currency),
+      });
+    }
+
+    const subtotal = fromMinor(reportMinor, currency);
     const tax = 0;
     const total = subtotal;
 

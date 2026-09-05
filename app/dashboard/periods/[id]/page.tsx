@@ -41,6 +41,7 @@ interface Period {
     clientName: string | null;
     clientCurrency: string;
     totalSeconds: number;
+    billableAmountMinor: number;
     billableAmount: number;
   }>;
 }

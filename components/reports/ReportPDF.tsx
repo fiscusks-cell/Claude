@@ -1,7 +1,14 @@
 import {
   Document, Page, Text, View, Svg, Rect, Path, Circle, G, Line, StyleSheet,
 } from '@react-pdf/renderer';
-import { groupCurrencyTotals, formatGroupedAmounts, formatCurrency } from '@/lib/currency';
+import {
+  apportionPercents,
+  amountMinor,
+  formatGroupedAmounts,
+  formatMinor,
+  groupCurrencyTotals,
+  rateToHundredths,
+} from '@/lib/currency';
 import { eachDayOfInterval, format, parseISO } from 'date-fns';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -21,18 +28,11 @@ interface PDFByDay {
   seconds: number;
 }
 
-interface PDFProjectStat {
-  clientId: string | null;
-  clientCurrency: string;
-  billableAmount: number;
-}
-
 export interface ReportPDFProps {
   orgName: string;
   dateRange: { start: string; end: string };
   entries: PDFEntry[];
   byDay: PDFByDay[];
-  byProject: PDFProjectStat[];
   totals: { totalSeconds: number; billableSeconds: number; activeDays: number };
 }
 
@@ -144,13 +144,12 @@ const styles = StyleSheet.create({
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function ReportPDF({ orgName, dateRange, entries, byDay, byProject, totals }: ReportPDFProps) {
+export function ReportPDF({ orgName, dateRange, entries, byDay, totals }: ReportPDFProps) {
   const { totalSeconds, billableSeconds, activeDays } = totals;
 
   // ── Summary metrics ────────────────────────────────────────────────────────
   const billablePct = totalSeconds > 0 ? ((billableSeconds / totalSeconds) * 100).toFixed(1) : '0.0';
   const avgDailyHours = activeDays > 0 ? (totalSeconds / 3600 / activeDays).toFixed(2) : '0.00';
-  const revenueStr = formatGroupedAmounts(groupCurrencyTotals(byProject));
 
   // ── Date range label ───────────────────────────────────────────────────────
   let dateLabel = '';
@@ -221,7 +220,10 @@ export function ReportPDF({ orgName, dateRange, entries, byDay, byProject, total
   }
 
   // ── Client → description breakdown ────────────────────────────────────────
-  type DescAgg = { seconds: number; revenue: number };
+  // Money: rounded once per time entry into integer minor units; description
+  // rows, client rows and the TOTAL row are integer sums of the same leaves, so
+  // the table foots at every level and matches the REVENUE card exactly.
+  type DescAgg = { seconds: number; revenueMinor: number };
   type ClientAgg = { name: string; currency: string; totalSec: number; descs: Map<string, DescAgg> };
   const clientMap = new Map<string, ClientAgg>();
 
@@ -231,23 +233,51 @@ export function ReportPDF({ orgName, dateRange, entries, byDay, byProject, total
     const cur = e.project?.client?.currency ?? 'USD';
     const desc = e.description?.trim() || '(No description)';
     const secs = e.durationSeconds ?? 0;
-    const rate = e.project ? Number(e.project.hourlyRate) : 0;
-    const rev = e.isBillable ? (secs / 3600) * rate : 0;
+    const rateHundredths = e.project ? rateToHundredths(e.project.hourlyRate) : 0;
+    const revMinor = e.isBillable ? amountMinor(secs, rateHundredths, cur) : 0;
 
     if (!clientMap.has(cid)) {
       clientMap.set(cid, { name: cName, currency: cur, totalSec: 0, descs: new Map() });
     }
     const c = clientMap.get(cid)!;
     c.totalSec += secs;
-    const d = c.descs.get(desc) ?? { seconds: 0, revenue: 0 };
+    const d = c.descs.get(desc) ?? { seconds: 0, revenueMinor: 0 };
     d.seconds += secs;
-    d.revenue += rev;
+    d.revenueMinor += revMinor;
     c.descs.set(desc, d);
   }
-  const clientRows = [...clientMap.values()].sort((a, b) => b.totalSec - a.totalSec);
 
-  const pct = (sec: number) =>
-    totalSeconds > 0 ? `${((sec / totalSeconds) * 100).toFixed(1)}%` : '0.0%';
+  // Percentages: largest-remainder apportionment over the description leaves
+  // (which partition the report total), then summed upward — so the column adds
+  // up to exactly 100.0 and each client row equals the sum of its rows.
+  const clientRows = [...clientMap.values()]
+    .sort((a, b) => b.totalSec - a.totalSec)
+    .map((c) => ({
+      ...c,
+      revenueMinor: [...c.descs.values()].reduce((s, d) => s + d.revenueMinor, 0),
+      descList: [...c.descs.entries()]
+        .sort((a, b) => b[1].seconds - a[1].seconds)
+        .map(([desc, agg]) => ({ desc, ...agg, pct: 0 })),
+      pct: 0,
+    }));
+
+  {
+    const leaves = clientRows.flatMap((c) => c.descList);
+    const leafPcts = apportionPercents(leaves.map((l) => l.seconds), totalSeconds);
+    leaves.forEach((l, i) => { l.pct = leafPcts[i]; });
+    for (const c of clientRows) {
+      c.pct = Math.round(c.descList.reduce((s, d) => s + d.pct * 10, 0)) / 10;
+    }
+  }
+  const totalPct = Math.round(clientRows.reduce((s, c) => s + c.pct * 10, 0)) / 10;
+
+  // Revenue card and TOTAL row come from the same integer sums as the table
+  // rows, grouped per currency — never added across currencies.
+  const revenueStr = formatGroupedAmounts(
+    groupCurrencyTotals(
+      clientRows.map((c) => ({ clientCurrency: c.currency, billableAmountMinor: c.revenueMinor })),
+    ),
+  );
 
   return (
     <Document>
@@ -377,45 +407,41 @@ export function ReportPDF({ orgName, dateRange, entries, byDay, byProject, total
                 <Text style={[styles.thText, styles.colRev]}>Revenue</Text>
               </View>
 
-              {clientRows.map((client, ci) => {
-                const clientRevenue = [...client.descs.values()].reduce((s, d) => s + d.revenue, 0);
-                const sortedClientDescs = [...client.descs.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
-                return (
-                  <View key={ci}>
-                    <View style={styles.clientRow}>
-                      <Text style={[styles.colDesc, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
-                        {client.name}
+              {clientRows.map((client, ci) => (
+                <View key={ci}>
+                  <View style={styles.clientRow}>
+                    <Text style={[styles.colDesc, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
+                      {client.name}
+                    </Text>
+                    <Text style={[styles.colDur, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
+                      {fmtHMS(client.totalSec)}
+                    </Text>
+                    <Text style={[styles.colPct, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
+                      {client.pct.toFixed(1)}%
+                    </Text>
+                    <Text style={[styles.colRev, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
+                      {client.revenueMinor > 0 ? formatMinor(client.revenueMinor, client.currency) : '—'}
+                    </Text>
+                  </View>
+                  {client.descList.map((row, di) => (
+                    <View key={di} style={styles.tableRow}>
+                      <Text style={[styles.colDesc, { paddingLeft: 12 }]}>
+                        {row.desc}
                       </Text>
-                      <Text style={[styles.colDur, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
-                        {fmtHMS(client.totalSec)}
-                      </Text>
-                      <Text style={[styles.colPct, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
-                        {pct(client.totalSec)}
-                      </Text>
-                      <Text style={[styles.colRev, { fontFamily: 'Helvetica-Bold', fontSize: 9, color: ACCENT }]}>
-                        {clientRevenue > 0 ? formatCurrency(clientRevenue, client.currency) : '—'}
+                      <Text style={styles.colDur}>{fmtHMS(row.seconds)}</Text>
+                      <Text style={styles.colPct}>{row.pct.toFixed(1)}%</Text>
+                      <Text style={styles.colRev}>
+                        {row.revenueMinor > 0 ? formatMinor(row.revenueMinor, client.currency) : '—'}
                       </Text>
                     </View>
-                    {sortedClientDescs.map(([desc, agg], di) => (
-                      <View key={di} style={styles.tableRow}>
-                        <Text style={[styles.colDesc, { paddingLeft: 12 }]}>
-                          {desc}
-                        </Text>
-                        <Text style={styles.colDur}>{fmtHMS(agg.seconds)}</Text>
-                        <Text style={styles.colPct}>{pct(agg.seconds)}</Text>
-                        <Text style={styles.colRev}>
-                          {agg.revenue > 0 ? formatCurrency(agg.revenue, client.currency) : '—'}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                );
-              })}
+                  ))}
+                </View>
+              ))}
 
               <View style={styles.totalRow}>
                 <Text style={[styles.colDesc, { fontFamily: 'Helvetica-Bold' }]}>TOTAL</Text>
                 <Text style={[styles.colDur, { fontFamily: 'Helvetica-Bold' }]}>{fmtHMS(totalSeconds)}</Text>
-                <Text style={[styles.colPct, { fontFamily: 'Helvetica-Bold' }]}>100%</Text>
+                <Text style={[styles.colPct, { fontFamily: 'Helvetica-Bold' }]}>{totalPct.toFixed(1)}%</Text>
                 <Text style={[styles.colRev, { fontFamily: 'Helvetica-Bold', color: ACCENT }]}>
                   {revenueStr || '—'}
                 </Text>

@@ -39,7 +39,16 @@ import {
   X,
 } from 'lucide-react';
 import { formatCurrency } from '@/lib/utils';
-import { groupCurrencyTotals, formatGroupedAmounts } from '@/lib/currency';
+import {
+  amountMinor,
+  apportionPercents,
+  currencyDecimals,
+  formatGroupedAmounts,
+  formatMinor,
+  fromMinor,
+  groupCurrencyTotals,
+  rateToHundredths,
+} from '@/lib/currency';
 import { ProjectCombobox } from '@/components/ui/ProjectCombobox';
 import { ProjectIconOrDot } from '@/components/ui/ProjectIconOrDot';
 
@@ -77,6 +86,7 @@ interface MemberStat {
   userName: string;
   totalSeconds: number;
   billableSeconds: number;
+  billableAmountMinor: number;
   billableAmount: number;
 }
 
@@ -90,6 +100,7 @@ interface ProjectStat {
   clientCurrency: string;
   totalSeconds: number;
   billableSeconds: number;
+  billableAmountMinor: number;
   billableAmount: number;
   members: MemberStat[];
 }
@@ -201,6 +212,19 @@ function workloadCellClass(seconds: number) {
   if (h < 6) return 'bg-indigo-900 text-indigo-300';
   if (h < 8) return 'bg-indigo-700 text-indigo-100';
   return 'bg-emerald-800 text-emerald-200';
+}
+
+// One entry's revenue in integer minor units — the same rounding leaf the
+// server uses for byProject, so the Detailed tab and CSV exports reconcile
+// exactly with the Summary aggregates and the PDF.
+function entryRevenueMinor(entry: TimeEntry): number {
+  if (!entry.isBillable || !entry.project) return 0;
+  const currency = entry.project.client?.currency ?? 'USD';
+  return amountMinor(
+    entry.durationSeconds ?? 0,
+    rateToHundredths(entry.project.hourlyRate),
+    currency,
+  );
 }
 
 function downloadCSV(rows: string[][], filename: string) {
@@ -524,8 +548,8 @@ export default function ReportsPage() {
         case 'billable':
           av = a.isBillable ? 1 : 0; bv = b.isBillable ? 1 : 0; break;
         case 'amount':
-          av = a.isBillable && a.project ? ((a.durationSeconds ?? 0) / 3600) * Number(a.project.hourlyRate) : 0;
-          bv = b.isBillable && b.project ? ((b.durationSeconds ?? 0) / 3600) * Number(b.project.hourlyRate) : 0;
+          av = entryRevenueMinor(a);
+          bv = entryRevenueMinor(b);
           break;
       }
       if (av < bv) return sortDir === 'asc' ? -1 : 1;
@@ -543,7 +567,28 @@ export default function ReportsPage() {
   // ── Profitability rows ──────────────────────────────────────────────────────
   const profitRows = useMemo(() => {
     if (!data) return [];
-    return [...data.byProject].sort((a, b) => b.billableAmount - a.billableAmount);
+    return [...data.byProject].sort((a, b) => b.billableAmountMinor - a.billableAmountMinor);
+  }, [data]);
+
+  // ── Summary breakdown percentages ───────────────────────────────────────────
+  // Largest-remainder apportionment: project rows partition the report total and
+  // member rows partition their project, so each displayed column sums exactly
+  // instead of drifting to 99.9% or 100.1%.
+  const breakdownPcts = useMemo(() => {
+    const project = new Map<string, number>();
+    const member = new Map<string, number>();
+    if (!data || data.totals.totalSeconds <= 0) return { project, member, total: 0 };
+    const pcts = apportionPercents(
+      data.byProject.map((p) => p.totalSeconds),
+      data.totals.totalSeconds,
+    );
+    data.byProject.forEach((p, i) => project.set(p.projectId ?? '__none__', pcts[i]));
+    for (const p of data.byProject) {
+      const mPcts = apportionPercents(p.members.map((m) => m.totalSeconds), p.totalSeconds);
+      p.members.forEach((m, i) => member.set(`${p.projectId ?? '__none__'}-${m.userId}`, mPcts[i]));
+    }
+    const total = Math.round(pcts.reduce((s, v) => s + v * 10, 0)) / 10;
+    return { project, member, total };
   }, [data]);
 
   // ── Sort handler ────────────────────────────────────────────────────────────
@@ -747,7 +792,6 @@ export default function ReportsPage() {
         dateRange,
         entries: data.entries,
         byDay: data.byDay,
-        byProject: data.byProject,
         totals: {
           totalSeconds: data.totals.totalSeconds,
           billableSeconds: data.totals.billableSeconds,
@@ -775,6 +819,7 @@ export default function ReportsPage() {
       ['Project', 'Client', 'Member', 'Date', 'Duration (h)', 'Billable', 'Amount'],
     ];
     for (const entry of data.entries) {
+      const cur = entry.project?.client?.currency ?? 'USD';
       rows.push([
         entry.project?.name ?? 'No Project',
         entry.project?.client?.name ?? '',
@@ -782,9 +827,7 @@ export default function ReportsPage() {
         format(new Date(entry.startedAt), 'yyyy-MM-dd'),
         ((entry.durationSeconds ?? 0) / 3600).toFixed(2),
         entry.isBillable ? 'Yes' : 'No',
-        entry.isBillable && entry.project
-          ? (((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)).toFixed(2)
-          : '0',
+        fromMinor(entryRevenueMinor(entry), cur).toFixed(currencyDecimals(cur)),
       ]);
     }
     downloadCSV(rows, 'ora-summary.csv');
@@ -796,6 +839,7 @@ export default function ReportsPage() {
       ['Date', 'Member', 'Client', 'Project', 'Description', 'Start', 'End', 'Duration (h)', 'Billable', 'Amount'],
     ];
     for (const entry of sortedEntries) {
+      const cur = entry.project?.client?.currency ?? 'USD';
       rows.push([
         format(new Date(entry.startedAt), 'yyyy-MM-dd'),
         entry.user.name ?? '',
@@ -806,9 +850,7 @@ export default function ReportsPage() {
         entry.stoppedAt ? fmtTime(entry.stoppedAt) : '',
         ((entry.durationSeconds ?? 0) / 3600).toFixed(2),
         entry.isBillable ? 'Yes' : 'No',
-        entry.isBillable && entry.project
-          ? (((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)).toFixed(2)
-          : '0',
+        fromMinor(entryRevenueMinor(entry), cur).toFixed(currencyDecimals(cur)),
       ]);
     }
     downloadCSV(rows, 'ora-detailed.csv');
@@ -1233,10 +1275,7 @@ export default function ReportsPage() {
                   {data.byProject.map((proj) => {
                     const key = proj.projectId ?? '__none__';
                     const isExpanded = expandedProjects.has(key);
-                    const pct =
-                      data.totals.totalSeconds > 0
-                        ? ((proj.totalSeconds / data.totals.totalSeconds) * 100).toFixed(1)
-                        : '0.0';
+                    const pct = (breakdownPcts.project.get(key) ?? 0).toFixed(1);
                     return (
                       <React.Fragment key={key}>
                         <tr
@@ -1273,10 +1312,9 @@ export default function ReportsPage() {
                         </tr>
                         {isExpanded &&
                           proj.members.map((member) => {
-                            const memberPct =
-                              proj.totalSeconds > 0
-                                ? ((member.totalSeconds / proj.totalSeconds) * 100).toFixed(1)
-                                : '0.0';
+                            const memberPct = (
+                              breakdownPcts.member.get(`${key}-${member.userId}`) ?? 0
+                            ).toFixed(1);
                             return (
                               <tr key={`${key}-${member.userId}`} className="border-b border-slate-800/30 bg-slate-900/50">
                                 <td className="px-4 py-2.5 pl-12">
@@ -1308,7 +1346,9 @@ export default function ReportsPage() {
                     <td className="px-4 py-3 text-right text-white">
                       {fmtHours(data.totals.totalSeconds)}
                     </td>
-                    <td className="px-4 py-3 text-right text-slate-400 hidden sm:table-cell">100%</td>
+                    <td className="px-4 py-3 text-right text-slate-400 hidden sm:table-cell">
+                      {breakdownPcts.total.toFixed(1)}%
+                    </td>
                     <td className="px-4 py-3 text-right text-white">
                       {formatGroupedAmounts(groupCurrencyTotals(data.byProject))}
                     </td>
@@ -1384,10 +1424,7 @@ export default function ReportsPage() {
                     {pagedEntries.map((entry) => {
                       const rowState = rowStates[entry.id] ?? 'idle';
                       const isEditing = editingCell?.entryId === entry.id;
-                      const amount =
-                        entry.isBillable && entry.project
-                          ? ((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)
-                          : 0;
+                      const amtMinor = entryRevenueMinor(entry);
 
                       let rowCls = 'border-b border-slate-800/60 ';
                       if (rowState === 'saved') rowCls += 'bg-emerald-950/40 transition-colors';
@@ -1561,8 +1598,8 @@ export default function ReportsPage() {
 
                           {/* Amount */}
                           <td className="px-4 py-3 text-slate-200 text-right whitespace-nowrap">
-                            {amount > 0 ? (
-                              formatCurrency(amount, entry.project?.client?.currency ?? 'USD')
+                            {amtMinor > 0 ? (
+                              formatMinor(amtMinor, entry.project?.client?.currency ?? 'USD')
                             ) : (
                               <span className="text-slate-600">—</span>
                             )}

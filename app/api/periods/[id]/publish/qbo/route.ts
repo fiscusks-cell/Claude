@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
 import { getValidClient, qboApiBase } from '@/lib/qbo';
-import { getCurrency, roundForCurrency } from '@/lib/currency';
+import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
 import { generatePeriodPdf } from '@/lib/generate-period-pdf';
 
 export async function POST(
@@ -74,40 +74,53 @@ export async function POST(
       Accept: 'application/json',
     };
 
+    // ── detect client currency ────────────────────────────────────────────────
+
+    let clientCurrency: string | null = null;
+    for (const entry of period.entries) {
+      const c = (entry.project?.client as { currency?: string } | null)?.currency;
+      if (c) {
+        clientCurrency = c.toUpperCase();
+        break;
+      }
+    }
+    const currency = clientCurrency ?? 'USD';
+
     // ── group billable entries by project ────────────────────────────────────
+    // Money is rounded once per time entry into integer minor units — the same
+    // leaf the Reports aggregation uses — so the invoice total reconciles
+    // exactly with the report for the same entries.
 
     type LineGroup = {
       projectName: string;
       clientName: string | null;
       qboCustomerId: string | null;
-      clientCurrency: string | null;
-      totalHours: number;
-      hourlyRate: number;
-      amount: number;
+      seconds: number;
+      rateHundredths: number;
+      amountMinor: number; // Σ per-entry minor units
     };
 
     const byProject = new Map<string, LineGroup>();
 
     for (const entry of period.entries) {
       const key = entry.projectId ?? '__no_project__';
-      const rate = entry.project ? parseFloat(entry.project.hourlyRate.toString()) : 0;
-      const hours = (entry.durationSeconds ?? 0) / 3600;
+      const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
+      const secs = entry.durationSeconds ?? 0;
 
       if (!byProject.has(key)) {
         byProject.set(key, {
           projectName: entry.project?.name ?? 'Time',
           clientName: entry.project?.client?.name ?? null,
           qboCustomerId: entry.project?.client?.qboCustomerId ?? null,
-          clientCurrency: (entry.project?.client as { currency?: string } | null)?.currency ?? null,
-          totalHours: 0,
-          hourlyRate: rate,
-          amount: 0,
+          seconds: 0,
+          rateHundredths,
+          amountMinor: 0,
         });
       }
 
       const g = byProject.get(key)!;
-      g.totalHours += hours;
-      g.amount += hours * rate;
+      g.seconds += secs;
+      g.amountMinor += amountMinor(secs, rateHundredths, currency);
     }
 
     // ── resolve or create QBO Customer for each unique client ────────────────
@@ -132,13 +145,6 @@ export async function POST(
       });
       const createData = (await createRes.json()) as { Customer: { Id: string } };
       return createData.Customer.Id;
-    }
-
-    // ── detect client currency ────────────────────────────────────────────────
-
-    let clientCurrency: string | null = null;
-    for (const [, g] of byProject) {
-      if (g.clientCurrency) { clientCurrency = g.clientCurrency.toUpperCase(); break; }
     }
 
     // ── build Invoice Line items ─────────────────────────────────────────────
@@ -166,25 +172,54 @@ export async function POST(
       primaryCustomerId = await ensureCustomer('Time Tracking Client', null);
     }
 
-    const currencyMeta = getCurrency(clientCurrency ?? 'USD');
-    const decimals = clientCurrency === 'JPY' ? 0 : 2;
+    const currencyMeta = getCurrency(currency);
+    const decimals = currencyDecimals(currency);
 
-    const lines = Array.from(byProject.values()).map((g, i) => {
-      const unitPrice = roundForCurrency(g.hourlyRate, clientCurrency ?? 'USD');
-      const lineAmount = roundForCurrency(g.amount, clientCurrency ?? 'USD');
+    // Each product line foots against its own Qty × UnitPrice: Qty is the exact
+    // hours (never rounded before the multiply, printed at the precision that
+    // makes the arithmetic check out) and Amount is round(hours × rate).
+    const groups = Array.from(byProject.values());
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, currency);
+
+    const lines = groups.map((g, i) => {
+      const qty = parseFloat((g.seconds / 3600).toFixed(6));
+      const unitPrice = g.rateHundredths / 100; // Decimal(10,2) — exact
       return {
         Id: String(i + 1),
         LineNum: i + 1,
-        Description: `${g.projectName} — ${g.totalHours.toFixed(2)} hrs @ ${currencyMeta.symbol} ${g.hourlyRate.toFixed(decimals)}/hr`,
-        Amount: lineAmount,
+        Description: `${g.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitPrice.toFixed(decimals)}/hr`,
+        Amount: fromMinor(lineFootMinor(g), currency),
         DetailType: 'SalesItemLineDetail',
         SalesItemLineDetail: {
-          Qty: parseFloat(g.totalHours.toFixed(4)),
+          Qty: qty,
           UnitPrice: unitPrice,
           ItemRef: { value: '1', name: 'Services' },
         },
       };
     });
+
+    // The invoice total must equal the report total for the same entries
+    // (Σ per-entry minor units). Per-entry rounding can leave the product lines
+    // a few minor units away from that, so the difference goes on its own
+    // disclosed line rather than distorting a product line.
+    const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
+    const linesMinor = groups.reduce((s, g) => s + lineFootMinor(g), 0);
+    const adjMinor = reportMinor - linesMinor;
+    if (adjMinor !== 0) {
+      const adjAmount = fromMinor(adjMinor, currency);
+      lines.push({
+        Id: String(lines.length + 1),
+        LineNum: lines.length + 1,
+        Description: 'Rounding adjustment',
+        Amount: adjAmount,
+        DetailType: 'SalesItemLineDetail',
+        SalesItemLineDetail: {
+          Qty: 1,
+          UnitPrice: adjAmount,
+          ItemRef: { value: '1', name: 'Services' },
+        },
+      });
+    }
 
     // ── resolve next DocNumber ────────────────────────────────────────────────
 

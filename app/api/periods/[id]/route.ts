@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
 
 export async function GET(
   _req: NextRequest,
@@ -32,17 +33,15 @@ export async function GET(
 
     if (!period) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    // Compute aggregate stats
+    // Compute aggregate stats.
+    // Money is rounded once per time entry into integer minor units — the same
+    // leaf Reports and the invoice routes use — so this page reconciles exactly
+    // with the invoice generated from it.
     const totalEntries = period.entries.length;
     const totalSeconds = period.entries.reduce(
       (sum, e) => sum + (e.durationSeconds ?? 0),
       0,
     );
-    const totalBillableAmount = period.entries.reduce((sum, e) => {
-      if (!e.isBillable || !e.durationSeconds || !e.project) return sum;
-      const rate = Number(e.project.hourlyRate);
-      return sum + (e.durationSeconds / 3600) * rate;
-    }, 0);
 
     // Group entries by project
     const projectMap = new Map<
@@ -56,7 +55,7 @@ export async function GET(
         clientCurrency: string;
         totalSeconds: number;
         billableSeconds: number;
-        billableAmount: number;
+        billableAmountMinor: number;
         entryCount: number;
       }
     >();
@@ -79,7 +78,7 @@ export async function GET(
           clientCurrency,
           totalSeconds: 0,
           billableSeconds: 0,
-          billableAmount: 0,
+          billableAmountMinor: 0,
           entryCount: 0,
         });
       }
@@ -90,15 +89,19 @@ export async function GET(
       group.entryCount += 1;
 
       if (entry.isBillable && entry.project) {
-        const rate = Number(entry.project.hourlyRate);
         group.billableSeconds += seconds;
-        group.billableAmount += (seconds / 3600) * rate;
+        group.billableAmountMinor += amountMinor(
+          seconds,
+          rateToHundredths(entry.project.hourlyRate),
+          clientCurrency,
+        );
       }
     }
 
     const byProject = Array.from(projectMap.values()).map((g) => ({
       ...g,
-      billableAmount: Math.round(g.billableAmount * 100) / 100,
+      // Major-unit convenience value, derived from the integer sum — display only.
+      billableAmount: fromMinor(g.billableAmountMinor, g.clientCurrency),
     }));
 
     return NextResponse.json({
@@ -106,7 +109,8 @@ export async function GET(
       stats: {
         totalEntries,
         totalSeconds,
-        totalBillableAmount: Math.round(totalBillableAmount * 100) / 100,
+        // Legacy: a cross-currency sum, only meaningful for single-currency periods.
+        totalBillableAmount: byProject.reduce((s, g) => s + g.billableAmount, 0),
       },
       byProject,
     });

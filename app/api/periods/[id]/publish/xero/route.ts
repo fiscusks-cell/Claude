@@ -3,7 +3,7 @@ import { Invoice, LineItem, Contact, LineAmountTypes, CurrencyCode } from 'xero-
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
 import { getValidXeroClient } from '@/lib/xero';
-import { getCurrency, roundForCurrency } from '@/lib/currency';
+import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
 import { generatePeriodPdf } from '@/lib/generate-period-pdf';
 
 export async function POST(
@@ -67,47 +67,52 @@ export async function POST(
 
     const { xero, tenantId } = await getValidXeroClient(sessionUser.id);
 
+    // ── detect client currency ────────────────────────────────────────────────
+
+    let clientCurrency = 'USD';
+    for (const entry of period.entries) {
+      const c = (entry.project?.client as { currency?: string } | null)?.currency;
+      if (c) {
+        clientCurrency = c.toUpperCase();
+        break;
+      }
+    }
+
     // ── group billable entries by project ────────────────────────────────────
+    // Money is rounded once per time entry into integer minor units — the same
+    // leaf the Reports aggregation uses — so the invoice total reconciles
+    // exactly with the report for the same entries.
 
     type LineGroup = {
       projectName: string;
       clientName: string | null;
       xeroContactId: string | null;
-      clientCurrency: string | null;
-      totalHours: number;
-      hourlyRate: number;
-      amount: number;
+      seconds: number;
+      rateHundredths: number;
+      amountMinor: number; // Σ per-entry minor units
     };
 
     const byProject = new Map<string, LineGroup>();
 
     for (const entry of period.entries) {
       const key = entry.projectId ?? '__no_project__';
-      const rate = entry.project ? parseFloat(entry.project.hourlyRate.toString()) : 0;
-      const hours = (entry.durationSeconds ?? 0) / 3600;
+      const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
+      const secs = entry.durationSeconds ?? 0;
 
       if (!byProject.has(key)) {
         byProject.set(key, {
           projectName: entry.project?.name ?? 'Time',
           clientName: entry.project?.client?.name ?? null,
           xeroContactId: entry.project?.client?.xeroContactId ?? null,
-          clientCurrency: (entry.project?.client as { currency?: string } | null)?.currency ?? null,
-          totalHours: 0,
-          hourlyRate: rate,
-          amount: 0,
+          seconds: 0,
+          rateHundredths,
+          amountMinor: 0,
         });
       }
 
       const g = byProject.get(key)!;
-      g.totalHours += hours;
-      g.amount += hours * rate;
-    }
-
-    // ── detect client currency ────────────────────────────────────────────────
-
-    let clientCurrency = 'USD';
-    for (const [, g] of byProject) {
-      if (g.clientCurrency) { clientCurrency = g.clientCurrency.toUpperCase(); break; }
+      g.seconds += secs;
+      g.amountMinor += amountMinor(secs, rateHundredths, clientCurrency);
     }
 
 
@@ -153,14 +158,44 @@ export async function POST(
     // ── build line items ─────────────────────────────────────────────────────
 
     const currencyMeta = getCurrency(clientCurrency);
-    const rateDecimals = clientCurrency === 'JPY' ? 0 : 2;
-    const lineItems: LineItem[] = Array.from(byProject.values()).map((g) => ({
-      description: `${g.projectName} — ${g.totalHours.toFixed(2)} hrs @ ${currencyMeta.symbol} ${g.hourlyRate.toFixed(rateDecimals)}/hr`,
-      quantity: parseFloat(g.totalHours.toFixed(4)),
-      unitAmount: roundForCurrency(g.hourlyRate, clientCurrency),
-      accountCode: '200',
-      lineAmount: roundForCurrency(g.amount, clientCurrency),
-    }));
+    const rateDecimals = currencyDecimals(clientCurrency);
+
+    // Each product line foots against its own quantity × unitAmount: quantity is
+    // the exact hours (never rounded before the multiply, printed at the
+    // precision that makes the arithmetic check out) and lineAmount is
+    // round(hours × rate).
+    const groups = Array.from(byProject.values());
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, clientCurrency);
+
+    const lineItems: LineItem[] = groups.map((g) => {
+      const qty = parseFloat((g.seconds / 3600).toFixed(6));
+      const unitAmount = g.rateHundredths / 100; // Decimal(10,2) — exact
+      return {
+        description: `${g.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitAmount.toFixed(rateDecimals)}/hr`,
+        quantity: qty,
+        unitAmount,
+        accountCode: '200',
+        lineAmount: fromMinor(lineFootMinor(g), clientCurrency),
+      };
+    });
+
+    // The invoice total must equal the report total for the same entries
+    // (Σ per-entry minor units). Per-entry rounding can leave the product lines
+    // a few minor units away from that, so the difference goes on its own
+    // disclosed line rather than distorting a product line.
+    const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
+    const linesMinor = groups.reduce((s, g) => s + lineFootMinor(g), 0);
+    const adjMinor = reportMinor - linesMinor;
+    if (adjMinor !== 0) {
+      const adjAmount = fromMinor(adjMinor, clientCurrency);
+      lineItems.push({
+        description: 'Rounding adjustment',
+        quantity: 1,
+        unitAmount: adjAmount,
+        accountCode: '200',
+        lineAmount: adjAmount,
+      });
+    }
 
     // ── validate currency is enabled in Xero ─────────────────────────────────
 
