@@ -4,6 +4,7 @@ import { requireAuth } from '@/lib/authz';
 import { getValidClient, qboApiBase } from '@/lib/qbo';
 import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
 import { generatePeriodPdf } from '@/lib/generate-period-pdf';
+import { analyzePeriodBilling } from '@/lib/period-billing';
 
 export async function POST(
   _req: NextRequest,
@@ -74,17 +75,27 @@ export async function POST(
       Accept: 'application/json',
     };
 
-    // ── detect client currency ────────────────────────────────────────────────
+    // ── resolve the one client and currency this invoice bills ───────────────
+    // A QBO invoice is one document filed under one Customer in one currency.
+    // Refused rather than resolved by picking a winner: publishing a period
+    // that spans clients would file everyone else's work under the first
+    // client's customer record, in the first client's currency.
 
-    let clientCurrency: string | null = null;
-    for (const entry of period.entries) {
-      const c = (entry.project?.client as { currency?: string } | null)?.currency;
-      if (c) {
-        clientCurrency = c.toUpperCase();
-        break;
-      }
+    const billing = analyzePeriodBilling(period.entries);
+    if (!billing.invoiceable) {
+      return NextResponse.json(
+        {
+          error: billing.conflict!.message,
+          conflict: billing.conflict!.kind,
+          clients: billing.clients,
+          currencies: billing.currencies,
+        },
+        { status: 409 },
+      );
     }
-    const currency = clientCurrency ?? 'USD';
+
+    const clientCurrency: string = billing.currency!.toUpperCase();
+    const currency = clientCurrency;
 
     // ── group billable entries by project ────────────────────────────────────
     // Money is rounded once per time entry into integer minor units — the same
@@ -95,6 +106,7 @@ export async function POST(
       projectName: string;
       clientName: string | null;
       qboCustomerId: string | null;
+      currency: string; // this line's own client's currency, never a sibling's
       seconds: number;
       rateHundredths: number;
       amountMinor: number; // Σ per-entry minor units
@@ -106,12 +118,17 @@ export async function POST(
       const key = entry.projectId ?? '__no_project__';
       const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
       const secs = entry.durationSeconds ?? 0;
+      // Derived per line from the project's own client. The guard above means
+      // these all agree, but the money is never computed against a currency
+      // borrowed from another line.
+      const lineCurrency = (entry.project?.client?.currency ?? currency).toUpperCase();
 
       if (!byProject.has(key)) {
         byProject.set(key, {
           projectName: entry.project?.name ?? 'Time',
           clientName: entry.project?.client?.name ?? null,
           qboCustomerId: entry.project?.client?.qboCustomerId ?? null,
+          currency: lineCurrency,
           seconds: 0,
           rateHundredths,
           amountMinor: 0,
@@ -120,7 +137,7 @@ export async function POST(
 
       const g = byProject.get(key)!;
       g.seconds += secs;
-      g.amountMinor += amountMinor(secs, rateHundredths, currency);
+      g.amountMinor += amountMinor(secs, rateHundredths, lineCurrency);
     }
 
     // ── resolve or create QBO Customer for each unique client ────────────────
@@ -149,27 +166,25 @@ export async function POST(
 
     // ── build Invoice Line items ─────────────────────────────────────────────
 
-    // Pick the primary customer (first group that has one, or "Time Tracking")
-    let primaryCustomerId: string | null = null;
+    // The invoice's customer is the period's one client, established by the
+    // guard above — not "whichever group sorted first". There is deliberately
+    // no catch-all fallback customer: work with no client is refused earlier
+    // rather than filed under a placeholder.
+    const invoiceClient = period.entries.find(
+      (e) => e.project?.client?.id === billing.client!.id,
+    )!.project!.client!;
 
-    for (const [, g] of byProject) {
-      if (g.clientName) {
-        primaryCustomerId = await ensureCustomer(g.clientName, g.qboCustomerId);
+    const primaryCustomerId = await ensureCustomer(
+      invoiceClient.name,
+      invoiceClient.qboCustomerId ?? null,
+    );
 
-        // persist QBO customer ID back to Client record if we resolved it
-        if (!g.qboCustomerId && g.clientName) {
-          await prisma.client.updateMany({
-            where: { organizationId: sessionUser.organizationId, name: g.clientName },
-            data: { qboCustomerId: primaryCustomerId },
-          });
-        }
-        break;
-      }
-    }
-
-    if (!primaryCustomerId) {
-      // fallback: use a catch-all customer
-      primaryCustomerId = await ensureCustomer('Time Tracking Client', null);
+    // persist QBO customer ID back to the Client record if we resolved it
+    if (!invoiceClient.qboCustomerId) {
+      await prisma.client.update({
+        where: { id: invoiceClient.id },
+        data: { qboCustomerId: primaryCustomerId },
+      });
     }
 
     const currencyMeta = getCurrency(currency);
@@ -179,7 +194,7 @@ export async function POST(
     // hours (never rounded before the multiply, printed at the precision that
     // makes the arithmetic check out) and Amount is round(hours × rate).
     const groups = Array.from(byProject.values());
-    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, currency);
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, g.currency);
 
     const lines = groups.map((g, i) => {
       const qty = parseFloat((g.seconds / 3600).toFixed(6));
@@ -188,7 +203,7 @@ export async function POST(
         Id: String(i + 1),
         LineNum: i + 1,
         Description: `${g.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitPrice.toFixed(decimals)}/hr`,
-        Amount: fromMinor(lineFootMinor(g), currency),
+        Amount: fromMinor(lineFootMinor(g), g.currency),
         DetailType: 'SalesItemLineDetail',
         SalesItemLineDetail: {
           Qty: qty,

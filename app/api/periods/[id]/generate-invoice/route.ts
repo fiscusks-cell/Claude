@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
 import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
+import { analyzePeriodBilling } from '@/lib/period-billing';
 import { generateInvoicePdf } from '@/lib/invoice-pdf';
 import { format, addDays } from 'date-fns';
 
@@ -44,21 +45,32 @@ export async function POST(
     });
     const invoiceNumber = `INV-${String(invoiceCount + 1).padStart(4, '0')}`;
 
-    // ── resolve client and currency ──────────────────────────────────────────
+    // ── resolve the one client and currency this invoice bills ───────────────
+    // Refused rather than resolved by picking a winner: an invoice is one
+    // document for one customer in one currency, so a period holding more than
+    // one client cannot become one invoice.
 
-    let billTo = { name: 'Unknown Client', email: '' };
-    let currency = 'USD';
-
-    for (const entry of period.entries) {
-      if (entry.project?.client) {
-        billTo = {
-          name: entry.project.client.name,
-          email: (entry.project.client as { email?: string }).email ?? '',
-        };
-        currency = ((entry.project.client as { currency?: string }).currency ?? 'USD').toUpperCase();
-        break;
-      }
+    const billing = analyzePeriodBilling(period.entries);
+    if (!billing.invoiceable) {
+      return NextResponse.json(
+        {
+          error: billing.conflict!.message,
+          conflict: billing.conflict!.kind,
+          clients: billing.clients,
+          currencies: billing.currencies,
+        },
+        { status: 409 },
+      );
     }
+
+    const currency = billing.currency!.toUpperCase();
+    const clientRecord = period.entries.find(
+      (e) => e.project?.client?.id === billing.client!.id,
+    )!.project!.client!;
+    const billTo = {
+      name: clientRecord.name,
+      email: (clientRecord as { email?: string }).email ?? '',
+    };
 
     // ── group entries by project ─────────────────────────────────────────────
     // Money is rounded once per time entry into integer minor units — the same
@@ -67,6 +79,7 @@ export async function POST(
 
     type LineGroup = {
       projectName: string;
+      currency: string; // this line's own client's currency, never a sibling's
       seconds: number;
       rateHundredths: number;
       amountMinor: number; // Σ per-entry minor units
@@ -78,10 +91,15 @@ export async function POST(
       const key = entry.projectId ?? '__no_project__';
       const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
       const secs = entry.durationSeconds ?? 0;
+      // Derived per line from the project's own client. The guard above means
+      // these all agree, but the money is never computed against a currency
+      // borrowed from another line.
+      const lineCurrency = (entry.project?.client?.currency ?? currency).toUpperCase();
 
       if (!byProject.has(key)) {
         byProject.set(key, {
           projectName: entry.project?.name ?? 'Time',
+          currency: lineCurrency,
           seconds: 0,
           rateHundredths,
           amountMinor: 0,
@@ -90,7 +108,7 @@ export async function POST(
 
       const g = byProject.get(key)!;
       g.seconds += secs;
-      g.amountMinor += amountMinor(secs, rateHundredths, currency);
+      g.amountMinor += amountMinor(secs, rateHundredths, lineCurrency);
     }
 
     // ── build line items and totals ──────────────────────────────────────────
@@ -101,13 +119,13 @@ export async function POST(
     // explicit rounding-adjustment line instead of being hidden in a line.
 
     const groups = Array.from(byProject.values());
-    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, currency);
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, g.currency);
 
     const lineItems = groups.map((g) => ({
       description: g.projectName,
       hours: parseFloat((g.seconds / 3600).toFixed(6)),
       rate: g.rateHundredths / 100,
-      amount: fromMinor(lineFootMinor(g), currency),
+      amount: fromMinor(lineFootMinor(g), g.currency),
     }));
 
     const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
@@ -149,18 +167,8 @@ export async function POST(
 
     // ── save invoice record ──────────────────────────────────────────────────
 
-    // Resolve clientId from entries
-    let clientId = '';
-    for (const entry of period.entries) {
-      if (entry.project?.client?.id) {
-        clientId = entry.project.client.id;
-        break;
-      }
-    }
-
-    if (!clientId) {
-      return NextResponse.json({ error: 'No client found on billable entries' }, { status: 400 });
-    }
+    // The one client this period bills, already established above.
+    const clientId = billing.client!.id!;
 
     const invoice = await prisma.invoice.create({
       data: {

@@ -44,6 +44,13 @@ interface Period {
     billableAmountMinor: number;
     billableAmount: number;
   }>;
+  billing?: {
+    clients: { id: string | null; name: string; currency: string | null; seconds: number }[];
+    currencies: string[];
+    currency: string | null;
+    invoiceable: boolean;
+    conflict: { kind: string; message: string } | null;
+  };
 }
 
 type StatusKey = Period['status'];
@@ -78,6 +85,7 @@ export default function PeriodDetailPage() {
   useEffect(() => { load(); }, [load]);
 
   const [successMsg, setSuccessMsg] = useState('');
+  const [showAllBillingClients, setShowAllBillingClients] = useState(false);
 
   const doAction = async (url: string, method = 'PATCH') => {
     setActionLoading(true);
@@ -193,6 +201,43 @@ export default function PeriodDetailPage() {
         </div>
       )}
 
+      {/* Not invoiceable as one document — shown before the buttons, not as a 409
+          after. Deliberately compact: periods here routinely hold 20 clients,
+          so the list truncates rather than filling the screen. */}
+      {period.billing && !period.billing.invoiceable && (
+        <div className="border border-amber-800/60 bg-amber-950/40 text-amber-200 text-sm rounded-lg px-4 py-3 mb-4">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="font-medium text-amber-100">Cannot be invoiced as one document</p>
+              <p className="mt-1 text-amber-200/90">{period.billing.conflict?.message}</p>
+              {period.billing.clients.length > 1 && (
+                <p className="mt-2 text-xs text-amber-200/80 break-words">
+                  {(showAllBillingClients
+                    ? period.billing.clients
+                    : period.billing.clients.slice(0, 3)
+                  )
+                    .map((c) =>
+                      `${c.name}${c.currency ? ` [${c.currency}]` : ''} ${(c.seconds / 3600).toFixed(2)}h`,
+                    )
+                    .join('  ·  ')}
+                  {period.billing.clients.length > 3 && (
+                    <button
+                      onClick={() => setShowAllBillingClients((v) => !v)}
+                      className="ml-2 underline hover:text-amber-100"
+                    >
+                      {showAllBillingClients
+                        ? 'show fewer'
+                        : `+${period.billing.clients.length - 3} more`}
+                    </button>
+                  )}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex gap-3 mb-8">
         {period.status === 'OPEN' && (
           <OriginButton
@@ -218,7 +263,8 @@ export default function PeriodDetailPage() {
           <>
             <OriginButton
               onClick={() => doAction(`/api/periods/${id}/publish/qbo`, 'POST')}
-              disabled={actionLoading}
+              disabled={actionLoading || period.billing?.invoiceable === false}
+              title={period.billing?.conflict?.message}
               className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
               style={{ background: '#15803d' }}
             >
@@ -226,7 +272,8 @@ export default function PeriodDetailPage() {
             </OriginButton>
             <OriginButton
               onClick={() => doAction(`/api/periods/${id}/publish/xero`, 'POST')}
-              disabled={actionLoading}
+              disabled={actionLoading || period.billing?.invoiceable === false}
+              title={period.billing?.conflict?.message}
               className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
               style={{ background: '#0369a1' }}
             >
@@ -234,7 +281,8 @@ export default function PeriodDetailPage() {
             </OriginButton>
             <OriginButton
               onClick={handleGenerateInvoice}
-              disabled={invoiceLoading}
+              disabled={invoiceLoading || period.billing?.invoiceable === false}
+              title={period.billing?.conflict?.message}
               className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
               style={{ background: '#4338ca' }}
             >

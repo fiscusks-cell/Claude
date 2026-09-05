@@ -5,6 +5,7 @@ import { requireAuth } from '@/lib/authz';
 import { getValidXeroClient } from '@/lib/xero';
 import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
 import { generatePeriodPdf } from '@/lib/generate-period-pdf';
+import { analyzePeriodBilling } from '@/lib/period-billing';
 
 export async function POST(
   _req: NextRequest,
@@ -67,16 +68,26 @@ export async function POST(
 
     const { xero, tenantId } = await getValidXeroClient(sessionUser.id);
 
-    // ── detect client currency ────────────────────────────────────────────────
+    // ── resolve the one client and currency this invoice bills ───────────────
+    // A Xero invoice is one document for one Contact in one currency. Refused
+    // rather than resolved by picking a winner: publishing a period that spans
+    // clients would bill everyone else's work to the first client's contact,
+    // in the first client's currency.
 
-    let clientCurrency = 'USD';
-    for (const entry of period.entries) {
-      const c = (entry.project?.client as { currency?: string } | null)?.currency;
-      if (c) {
-        clientCurrency = c.toUpperCase();
-        break;
-      }
+    const billing = analyzePeriodBilling(period.entries);
+    if (!billing.invoiceable) {
+      return NextResponse.json(
+        {
+          error: billing.conflict!.message,
+          conflict: billing.conflict!.kind,
+          clients: billing.clients,
+          currencies: billing.currencies,
+        },
+        { status: 409 },
+      );
     }
+
+    const clientCurrency: string = billing.currency!.toUpperCase();
 
     // ── group billable entries by project ────────────────────────────────────
     // Money is rounded once per time entry into integer minor units — the same
@@ -87,6 +98,7 @@ export async function POST(
       projectName: string;
       clientName: string | null;
       xeroContactId: string | null;
+      currency: string; // this line's own client's currency, never a sibling's
       seconds: number;
       rateHundredths: number;
       amountMinor: number; // Σ per-entry minor units
@@ -98,12 +110,17 @@ export async function POST(
       const key = entry.projectId ?? '__no_project__';
       const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
       const secs = entry.durationSeconds ?? 0;
+      // Derived per line from the project's own client. The guard above means
+      // these all agree, but the money is never computed against a currency
+      // borrowed from another line.
+      const lineCurrency = (entry.project?.client?.currency ?? clientCurrency).toUpperCase();
 
       if (!byProject.has(key)) {
         byProject.set(key, {
           projectName: entry.project?.name ?? 'Time',
           clientName: entry.project?.client?.name ?? null,
           xeroContactId: entry.project?.client?.xeroContactId ?? null,
+          currency: lineCurrency,
           seconds: 0,
           rateHundredths,
           amountMinor: 0,
@@ -112,7 +129,7 @@ export async function POST(
 
       const g = byProject.get(key)!;
       g.seconds += secs;
-      g.amountMinor += amountMinor(secs, rateHundredths, clientCurrency);
+      g.amountMinor += amountMinor(secs, rateHundredths, lineCurrency);
     }
 
 
@@ -133,26 +150,25 @@ export async function POST(
       return contactId;
     }
 
-    let primaryContactId: string | null = null;
-    let primaryClientName: string | null = null;
+    // The invoice's contact is the period's one client, established by the guard
+    // above — not "whichever group sorted first". There is deliberately no
+    // catch-all fallback contact: work with no client is refused earlier rather
+    // than billed to a placeholder.
+    const invoiceClient = period.entries.find(
+      (e) => e.project?.client?.id === billing.client!.id,
+    )!.project!.client!;
 
-    for (const [, g] of byProject) {
-      if (g.clientName) {
-        primaryContactId = await ensureContact(g.clientName, g.xeroContactId);
-        primaryClientName = g.clientName;
+    const primaryClientName: string = invoiceClient.name;
+    const primaryContactId = await ensureContact(
+      invoiceClient.name,
+      invoiceClient.xeroContactId ?? null,
+    );
 
-        if (!g.xeroContactId) {
-          await prisma.client.updateMany({
-            where: { organizationId: sessionUser.organizationId, name: g.clientName },
-            data: { xeroContactId: primaryContactId },
-          });
-        }
-        break;
-      }
-    }
-
-    if (!primaryContactId) {
-      primaryContactId = await ensureContact('Time Tracking Client', null);
+    if (!invoiceClient.xeroContactId) {
+      await prisma.client.update({
+        where: { id: invoiceClient.id },
+        data: { xeroContactId: primaryContactId },
+      });
     }
 
     // ── build line items ─────────────────────────────────────────────────────
@@ -165,7 +181,7 @@ export async function POST(
     // precision that makes the arithmetic check out) and lineAmount is
     // round(hours × rate).
     const groups = Array.from(byProject.values());
-    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, clientCurrency);
+    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, g.currency);
 
     const lineItems: LineItem[] = groups.map((g) => {
       const qty = parseFloat((g.seconds / 3600).toFixed(6));
@@ -175,7 +191,7 @@ export async function POST(
         quantity: qty,
         unitAmount,
         accountCode: '200',
-        lineAmount: fromMinor(lineFootMinor(g), clientCurrency),
+        lineAmount: fromMinor(lineFootMinor(g), g.currency),
       };
     });
 

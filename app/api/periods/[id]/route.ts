@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
+import { analyzePeriodBilling } from '@/lib/period-billing';
 
 export async function GET(
   _req: NextRequest,
@@ -104,8 +105,13 @@ export async function GET(
       billableAmount: fromMinor(g.billableAmountMinor, g.clientCurrency),
     }));
 
+    // Whether this period can become one invoice, so the review screen can say
+    // so before anyone reaches a publish button rather than after a 409.
+    const billing = analyzePeriodBilling(period.entries);
+
     return NextResponse.json({
       ...period,
+      billing,
       stats: {
         totalEntries,
         totalSeconds,
