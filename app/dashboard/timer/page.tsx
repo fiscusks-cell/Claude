@@ -767,7 +767,7 @@ export default function TimerPage() {
 
       {/* ── Top bar ──────────────────────────────────────────────────────── */}
       <div
-        className="flex flex-wrap sm:flex-nowrap items-center gap-2 rounded-xl px-4 py-3"
+        className="flex flex-wrap sm:flex-nowrap items-center gap-2 rounded-xl px-5 py-4"
         style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
       >
         {/* ── Description ─ 50% at sm+ ─────────────────────────────────── */}
@@ -783,7 +783,7 @@ export default function TimerPage() {
               handleDescFocus();
             }}
             onBlur={() => { hideDescTimer.current = setTimeout(() => setShowDescs(false), 150); }}
-            className="w-full bg-transparent text-sm focus:outline-none"
+            className="w-full bg-transparent text-base focus:outline-none"
             style={{ color: 'var(--text)' }}
           />
           {showDescs && recentDescs.length > 0 && (
@@ -858,7 +858,7 @@ export default function TimerPage() {
           </button>
 
           <span
-            className="text-xl tabular-nums tracking-tight select-none"
+            className="text-2xl tabular-nums tracking-tight select-none"
             style={{ color: storePaused ? '#f59e0b' : isRunning ? 'var(--accent)' : 'var(--text-muted)' }}
           >
             {formatElapsed(elapsed)}
@@ -867,7 +867,7 @@ export default function TimerPage() {
           <OriginButton
             onClick={isRunning ? handleStop : () => handleStart()}
             disabled={loading || storePaused}
-            className="px-5 py-2 rounded-lg text-sm transition-colors disabled:opacity-50 flex-shrink-0"
+            className="px-5 py-2.5 rounded-lg text-sm transition-colors disabled:opacity-50 flex-shrink-0"
             style={{
               background: storePaused ? 'rgba(245,158,11,0.15)' : isRunning ? 'var(--error)' : 'var(--accent)',
               color: storePaused ? '#f59e0b' : 'white',
@@ -894,7 +894,7 @@ export default function TimerPage() {
               >
                 {/* Week header — rounded-t-xl clips its background at the top corners */}
                 <div
-                  className="flex items-center justify-between px-4 py-2 rounded-t-xl overflow-hidden"
+                  className="flex items-center justify-between px-4 py-2.5 rounded-t-xl overflow-hidden"
                   style={{ background: 'var(--surface-raised)', borderBottom: '1px solid var(--border)' }}
                 >
                   <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>{week.label}</span>
@@ -906,7 +906,7 @@ export default function TimerPage() {
                   <div key={day.dateKey}>
                     {/* Day header */}
                     <div
-                      className="flex items-center justify-between px-4 py-1.5"
+                      className="flex items-center justify-between px-4 py-2"
                       style={{
                         background: 'var(--surface)',
                         borderBottom: '1px solid var(--border)',
@@ -935,7 +935,7 @@ export default function TimerPage() {
                             return (
                               <div
                                 key={entry.id}
-                                className="group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-white/[0.03]"
+                                className="group flex items-center gap-3 px-4 py-3.5 transition-colors hover:bg-white/[0.03]"
                                 style={isLastVisible && notLastGroup ? { borderBottom: '1px solid var(--border)' } : undefined}
                               >
                                 {/* Description — click to edit inline */}
@@ -943,7 +943,7 @@ export default function TimerPage() {
                                   <input
                                     type="text"
                                     autoFocus
-                                    className="flex-1 text-sm min-w-0 rounded px-2 py-0.5 focus:outline-none focus:ring-1"
+                                    className="flex-1 text-base min-w-0 rounded px-2 py-0.5 focus:outline-none focus:ring-1"
                                     style={{
                                       background: 'var(--surface-raised)',
                                       border: '1px solid var(--accent)',
@@ -961,7 +961,7 @@ export default function TimerPage() {
                                   />
                                 ) : (
                                   <span
-                                    className="flex-1 text-sm truncate min-w-0 cursor-text rounded-sm px-1 -mx-1 hover:bg-white/5 transition-colors"
+                                    className="flex-1 text-base truncate min-w-0 cursor-text rounded-sm px-1 -mx-1 hover:bg-white/5 transition-colors"
                                     style={{ color: entry.description ? 'var(--text)' : 'var(--text-muted)' }}
                                     onClick={() => { setOpenKebab(null); setInlineEdit({ entryId: entry.id, field: 'description' }); setInlineDesc(entry.description ?? ''); }}
                                   >
@@ -1017,7 +1017,7 @@ export default function TimerPage() {
 
                                 {/* Client — read-only, hidden while project combobox is open */}
                                 {!(inlineEdit?.entryId === entry.id && inlineEdit.field === 'project') && entry.project?.client && (
-                                  <span className="text-sm flex-shrink-0 hidden md:block" style={{ color: 'var(--text-muted)' }}>
+                                  <span className="text-xs flex-shrink-0 hidden md:block" style={{ color: 'var(--text-muted)' }}>
                                     — {entry.project.client.name}
                                   </span>
                                 )}
@@ -1158,14 +1158,14 @@ export default function TimerPage() {
 
                                 {/* Duration — group total is read-only; individual entries are click-to-edit */}
                                 {(isMulti && !isExpanded) ? (
-                                  <span className="text-sm tabular-nums flex-shrink-0" style={{ color: 'var(--text)' }}>
+                                  <span className="text-base tabular-nums flex-shrink-0" style={{ color: 'var(--text)' }}>
                                     {formatHM(groupTotal)}
                                   </span>
                                 ) : inlineEdit?.entryId === entry.id && inlineEdit.field === 'duration' ? (
                                   <input
                                     type="text"
                                     autoFocus
-                                    className="w-20 text-sm tabular-nums rounded px-1 py-0.5 flex-shrink-0 focus:outline-none"
+                                    className="w-20 text-base tabular-nums rounded px-1 py-0.5 flex-shrink-0 focus:outline-none"
                                     style={{
                                       background: 'var(--surface-raised)',
                                       border: `1px solid ${durationInvalid ? 'var(--error)' : 'var(--accent)'}`,
@@ -1200,7 +1200,7 @@ export default function TimerPage() {
                                   />
                                 ) : (
                                   <span
-                                    className="text-sm tabular-nums flex-shrink-0 cursor-text rounded-sm px-0.5 -mx-0.5 hover:bg-white/5 transition-colors"
+                                    className="text-base tabular-nums flex-shrink-0 cursor-text rounded-sm px-0.5 -mx-0.5 hover:bg-white/5 transition-colors"
                                     style={{ color: 'var(--text)' }}
                                     onClick={() => { setOpenKebab(null); setInlineEdit({ entryId: entry.id, field: 'duration' }); setInlineDuration(formatHMS(seconds)); setDurationInvalid(false); }}
                                     title="Click to edit duration"
