@@ -1,6 +1,7 @@
 import { renderToBuffer } from '@react-pdf/renderer';
 import { PeriodReport } from '@/components/reports/PeriodReport';
 import { createElement } from 'react';
+import { amountMinor, fromMinor, rateToHundredths } from '@/lib/currency';
 
 interface PeriodEntry {
   id: string;
@@ -25,37 +26,53 @@ interface PeriodData {
 export async function generatePeriodPdf(period: PeriodData, orgName?: string): Promise<Buffer> {
   const resolvedOrgName = orgName ?? period.organization?.name ?? 'ORA';
 
-  const projectMap = new Map<string, { projectName: string; currency: string; hours: number; rate: number; subtotal: number }>();
+  // Money is rounded once per time entry into integer minor units — the same
+  // leaf the Reports aggregation and invoice totals use — so this attachment
+  // reconciles exactly with the invoice it accompanies. Totals are summed per
+  // currency, never across currencies.
+  const projectMap = new Map<
+    string,
+    { projectName: string; currency: string; seconds: number; rateHundredths: number; minor: number }
+  >();
 
   for (const entry of period.entries) {
     if (!entry.isBillable) continue;
     const key = entry.projectId ?? entry.project?.name ?? '__none__';
-    const rate = entry.project ? parseFloat(String(entry.project.hourlyRate)) : 0;
-    const hours = (entry.durationSeconds ?? 0) / 3600;
+    const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
+    const secs = entry.durationSeconds ?? 0;
     const currency = entry.project?.client?.currency ?? 'USD';
 
     if (!projectMap.has(key)) {
       projectMap.set(key, {
         projectName: entry.project?.name ?? 'No Project',
         currency,
-        hours: 0,
-        rate,
-        subtotal: 0,
+        seconds: 0,
+        rateHundredths,
+        minor: 0,
       });
     }
 
     const p = projectMap.get(key)!;
-    p.hours += hours;
-    p.subtotal += hours * rate;
+    p.seconds += secs;
+    p.minor += amountMinor(secs, rateHundredths, currency);
   }
 
-  const projectSummaries = Array.from(projectMap.values());
+  const projectSummaries = Array.from(projectMap.values()).map((p) => ({
+    projectName: p.projectName,
+    currency: p.currency,
+    hours: p.seconds / 3600,
+    rate: p.rateHundredths / 100,
+    subtotal: fromMinor(p.minor, p.currency),
+  }));
 
-  const currencyMap = new Map<string, number>();
-  for (const p of projectSummaries) {
-    currencyMap.set(p.currency, (currencyMap.get(p.currency) ?? 0) + p.subtotal);
+  const currencyMinor = new Map<string, number>();
+  for (const p of projectMap.values()) {
+    currencyMinor.set(p.currency, (currencyMinor.get(p.currency) ?? 0) + p.minor);
   }
-  const currencyTotals = [...currencyMap.entries()].map(([currency, amount]) => ({ currency, amount }));
+  const currencyTotals = [...currencyMinor.entries()].map(([currency, minor]) => ({
+    currency,
+    amount: fromMinor(minor, currency),
+  }));
 
   const totalSeconds = period.entries.reduce((s, e) => s + (e.durationSeconds ?? 0), 0);
 

@@ -39,7 +39,16 @@ import {
   X,
 } from 'lucide-react';
 import { formatCurrency } from '@/lib/utils';
-import { groupCurrencyTotals, formatGroupedAmounts } from '@/lib/currency';
+import {
+  amountMinor,
+  apportionPercents,
+  currencyDecimals,
+  formatGroupedAmounts,
+  formatMinor,
+  fromMinor,
+  groupCurrencyTotals,
+  rateToHundredths,
+} from '@/lib/currency';
 import { ProjectCombobox } from '@/components/ui/ProjectCombobox';
 import { ProjectIconOrDot } from '@/components/ui/ProjectIconOrDot';
 
@@ -77,6 +86,7 @@ interface MemberStat {
   userName: string;
   totalSeconds: number;
   billableSeconds: number;
+  billableAmountMinor: number;
   billableAmount: number;
 }
 
@@ -90,6 +100,7 @@ interface ProjectStat {
   clientCurrency: string;
   totalSeconds: number;
   billableSeconds: number;
+  billableAmountMinor: number;
   billableAmount: number;
   members: MemberStat[];
 }
@@ -203,6 +214,19 @@ function workloadCellClass(seconds: number) {
   return 'bg-emerald-800 text-emerald-200';
 }
 
+// One entry's revenue in integer minor units — the same rounding leaf the
+// server uses for byProject, so the Detailed tab and CSV exports reconcile
+// exactly with the Summary aggregates and the PDF.
+function entryRevenueMinor(entry: TimeEntry): number {
+  if (!entry.isBillable || !entry.project) return 0;
+  const currency = entry.project.client?.currency ?? 'USD';
+  return amountMinor(
+    entry.durationSeconds ?? 0,
+    rateToHundredths(entry.project.hourlyRate),
+    currency,
+  );
+}
+
 function downloadCSV(rows: string[][], filename: string) {
   const csv = rows.map((r) => r.map((v) => `"${v}"`).join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -264,6 +288,10 @@ export default function ReportsPage() {
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [allClients, setAllClients] = useState<{ id: string; name: string }[]>([]);
   const [allFilterProjects, setAllFilterProjects] = useState<{ id: string; name: string; isArchived: boolean }[]>([]);
+  const [projectDetails, setProjectDetails] = useState<
+    Record<string, NonNullable<TimeEntry['project']>>
+  >({});
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
 
   // Detailed tab state
@@ -340,26 +368,70 @@ export default function ReportsPage() {
   }, [preset, customStart, customEnd]);
 
   // ── Fetch reports ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!dateRange.start || !dateRange.end) return;
-    const params = new URLSearchParams({
-      startDate: dateRange.start,
-      endDate: dateRange.end + 'T23:59:59',
-    });
-    if (filters.clientId) params.set('clientId', filters.clientId);
-    if (filters.projectId) params.set('projectId', filters.projectId);
-    if (filters.userId) params.set('userId', filters.userId);
-    if (filters.billable) params.set('billable', filters.billable);
+  // byDay / byProject / totals are aggregated server-side, so this request is the only
+  // thing that can bring them back in step after an entry changes.
+  const reportSeq = useRef(0);
+  const activeLoads = useRef(0);
+  const pendingEdits = useRef(new Map<string, Partial<TimeEntry>>());
 
-    setLoading(true);
-    fetch(`/api/reports?${params}`)
-      .then((r) => r.json())
-      .then((d: ReportData) => {
-        setData(d);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, [dateRange, filters]);
+  // An in-flight edit is re-applied over a freshly fetched list, so a response issued
+  // before that edit landed can't visibly undo the user's own change.
+  const applyPendingEdits = useCallback((d: ReportData): ReportData => {
+    if (pendingEdits.current.size === 0) return d;
+    return {
+      ...d,
+      entries: d.entries.map((e) => {
+        const patch = pendingEdits.current.get(e.id);
+        return patch ? { ...e, ...patch } : e;
+      }),
+    };
+  }, []);
+
+  const fetchReport = useCallback(
+    async ({ silent = false }: { silent?: boolean } = {}): Promise<boolean> => {
+      if (!dateRange.start || !dateRange.end) return false;
+      const params = new URLSearchParams({
+        startDate: dateRange.start,
+        endDate: dateRange.end + 'T23:59:59',
+      });
+      if (filters.clientId) params.set('clientId', filters.clientId);
+      if (filters.projectId) params.set('projectId', filters.projectId);
+      if (filters.userId) params.set('userId', filters.userId);
+      if (filters.billable) params.set('billable', filters.billable);
+
+      const seq = ++reportSeq.current;
+      if (!silent) {
+        activeLoads.current += 1;
+        setLoading(true);
+      }
+      try {
+        const res = await fetch(`/api/reports?${params}`);
+        if (!res.ok) throw new Error(`Reports request failed: ${res.status}`);
+        const d = (await res.json()) as ReportData;
+        // Superseded while in flight — dropping it stops a slow earlier response from
+        // overwriting newer data.
+        if (seq !== reportSeq.current) return true;
+        setData(applyPendingEdits(d));
+        setRefreshError(null);
+        return true;
+      } catch (err) {
+        console.error(err);
+        // Only the newest request reports failure; a superseded one is not the
+        // caller's answer.
+        return seq !== reportSeq.current;
+      } finally {
+        if (!silent) {
+          activeLoads.current -= 1;
+          if (activeLoads.current === 0) setLoading(false);
+        }
+      }
+    },
+    [dateRange, filters, applyPendingEdits],
+  );
+
+  useEffect(() => {
+    void fetchReport();
+  }, [fetchReport]);
 
   // ── Fetch org-scoped filter options (once on mount, independent of report filters) ──
   useEffect(() => {
@@ -373,13 +445,27 @@ export default function ReportsPage() {
         setAllClients((clients as { id: string; name: string }[]).map(({ id, name }) => ({ id, name })));
         const rp = rawProjects as {
           id: string; name: string; color: string; icon?: string | null;
-          isArchived: boolean; client?: { name: string } | null;
+          hourlyRate: string | number; isBillable: boolean; isArchived: boolean;
+          client?: { id: string; name: string; currency: string } | null;
         }[];
         setAllFilterProjects(rp.map((p) => ({ id: p.id, name: p.name, isArchived: p.isArchived })));
         setProjects(rp.map((p) => ({
           id: p.id, name: p.name, color: p.color,
           icon: p.icon ?? null, clientName: p.client?.name ?? null,
         })));
+        // Full project shape for inline edits. The PATCH response's project include
+        // omits icon and client currency, so reconcile against this rather than it.
+        setProjectDetails(
+          Object.fromEntries(
+            rp.map((p) => [
+              p.id,
+              {
+                id: p.id, name: p.name, color: p.color, icon: p.icon ?? null,
+                hourlyRate: p.hourlyRate, isBillable: p.isBillable, client: p.client ?? null,
+              },
+            ]),
+          ),
+        );
       })
       .catch(console.error);
   }, []);
@@ -462,8 +548,8 @@ export default function ReportsPage() {
         case 'billable':
           av = a.isBillable ? 1 : 0; bv = b.isBillable ? 1 : 0; break;
         case 'amount':
-          av = a.isBillable && a.project ? ((a.durationSeconds ?? 0) / 3600) * Number(a.project.hourlyRate) : 0;
-          bv = b.isBillable && b.project ? ((b.durationSeconds ?? 0) / 3600) * Number(b.project.hourlyRate) : 0;
+          av = entryRevenueMinor(a);
+          bv = entryRevenueMinor(b);
           break;
       }
       if (av < bv) return sortDir === 'asc' ? -1 : 1;
@@ -481,7 +567,28 @@ export default function ReportsPage() {
   // ── Profitability rows ──────────────────────────────────────────────────────
   const profitRows = useMemo(() => {
     if (!data) return [];
-    return [...data.byProject].sort((a, b) => b.billableAmount - a.billableAmount);
+    return [...data.byProject].sort((a, b) => b.billableAmountMinor - a.billableAmountMinor);
+  }, [data]);
+
+  // ── Summary breakdown percentages ───────────────────────────────────────────
+  // Largest-remainder apportionment: project rows partition the report total and
+  // member rows partition their project, so each displayed column sums exactly
+  // instead of drifting to 99.9% or 100.1%.
+  const breakdownPcts = useMemo(() => {
+    const project = new Map<string, number>();
+    const member = new Map<string, number>();
+    if (!data || data.totals.totalSeconds <= 0) return { project, member, total: 0 };
+    const pcts = apportionPercents(
+      data.byProject.map((p) => p.totalSeconds),
+      data.totals.totalSeconds,
+    );
+    data.byProject.forEach((p, i) => project.set(p.projectId ?? '__none__', pcts[i]));
+    for (const p of data.byProject) {
+      const mPcts = apportionPercents(p.members.map((m) => m.totalSeconds), p.totalSeconds);
+      p.members.forEach((m, i) => member.set(`${p.projectId ?? '__none__'}-${m.userId}`, mPcts[i]));
+    }
+    const total = Math.round(pcts.reduce((s, v) => s + v * 10, 0)) / 10;
+    return { project, member, total };
   }, [data]);
 
   // ── Sort handler ────────────────────────────────────────────────────────────
@@ -518,51 +625,146 @@ export default function ReportsPage() {
     setEditValue('');
   }
 
+  const patchEntry = useCallback((entryId: string, patch: Partial<TimeEntry>) => {
+    setData((prev) =>
+      prev
+        ? { ...prev, entries: prev.entries.map((e) => (e.id === entryId ? { ...e, ...patch } : e)) }
+        : prev,
+    );
+  }, []);
+
+  const resolveProject = useCallback(
+    (projectId: string | null | undefined): TimeEntry['project'] =>
+      projectId ? projectDetails[projectId] ?? null : null,
+    [projectDetails],
+  );
+
+  // The PATCH body plus the matching local patch, so the row shows the new value before
+  // the round trip finishes. Duration mirrors the server's own recalculation.
+  function buildEditPatch(
+    entry: TimeEntry,
+    field: NonNullable<EditingCell>['field'],
+    value: string,
+  ): { body: Record<string, unknown>; optimistic: Partial<TimeEntry> } | null {
+    const secondsBetween = (startedAt: string, stoppedAt: string) =>
+      Math.max(
+        0,
+        Math.round((new Date(stoppedAt).getTime() - new Date(startedAt).getTime()) / 1000),
+      );
+    const atTime = (base: string, hhmm: string): string | null => {
+      const [h, m] = hhmm.split(':').map(Number);
+      if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+      const d = new Date(base);
+      d.setHours(h, m, 0, 0);
+      return d.toISOString();
+    };
+
+    switch (field) {
+      case 'description':
+        return { body: { description: value }, optimistic: { description: value } };
+      case 'projectId': {
+        const projectId = value || null;
+        return {
+          body: { projectId },
+          optimistic: { projectId, project: resolveProject(projectId) },
+        };
+      }
+      case 'startedAt': {
+        const startedAt = atTime(entry.startedAt, value);
+        if (!startedAt) return null;
+        return {
+          body: { startedAt },
+          optimistic: {
+            startedAt,
+            durationSeconds: entry.stoppedAt ? secondsBetween(startedAt, entry.stoppedAt) : null,
+          },
+        };
+      }
+      case 'stoppedAt': {
+        if (!entry.stoppedAt) return null;
+        const stoppedAt = atTime(entry.stoppedAt, value);
+        if (!stoppedAt) return null;
+        return {
+          body: { stoppedAt },
+          optimistic: { stoppedAt, durationSeconds: secondsBetween(entry.startedAt, stoppedAt) },
+        };
+      }
+      case 'duration': {
+        const parts = value.split(':');
+        const totalSecs = (parseInt(parts[0]) || 0) * 3600 + (parseInt(parts[1] || '0') || 0) * 60;
+        const stoppedAt = new Date(
+          new Date(entry.startedAt).getTime() + totalSecs * 1000,
+        ).toISOString();
+        return { body: { stoppedAt }, optimistic: { stoppedAt, durationSeconds: totalSecs } };
+      }
+      case 'isBillable': {
+        const isBillable = value === 'true';
+        return { body: { isBillable }, optimistic: { isBillable } };
+      }
+    }
+  }
+
   async function commitEditValue(
     entry: TimeEntry,
     field: NonNullable<EditingCell>['field'],
     value: string,
   ) {
+    const patch = buildEditPatch(entry, field, value);
+    if (!patch) return;
+
+    // Rollback snapshot: every field an inline edit can touch.
+    const before: Partial<TimeEntry> = {
+      description: entry.description,
+      projectId: entry.projectId,
+      project: entry.project,
+      startedAt: entry.startedAt,
+      stoppedAt: entry.stoppedAt,
+      durationSeconds: entry.durationSeconds,
+      isBillable: entry.isBillable,
+    };
+
     setRowStates((prev) => ({ ...prev, [entry.id]: 'saving' }));
-    let body: Record<string, unknown> = {};
-    if (field === 'description') {
-      body = { description: value };
-    } else if (field === 'projectId') {
-      body = { projectId: value || null };
-    } else if (field === 'startedAt') {
-      const d = new Date(entry.startedAt);
-      const [h, m] = value.split(':').map(Number);
-      d.setHours(h, m, 0, 0);
-      body = { startedAt: d.toISOString() };
-    } else if (field === 'stoppedAt' && entry.stoppedAt) {
-      const d = new Date(entry.stoppedAt);
-      const [h, m] = value.split(':').map(Number);
-      d.setHours(h, m, 0, 0);
-      body = { stoppedAt: d.toISOString() };
-    } else if (field === 'duration') {
-      const parts = value.split(':');
-      const totalSecs = (parseInt(parts[0]) || 0) * 3600 + (parseInt(parts[1] || '0') || 0) * 60;
-      const newStop = new Date(new Date(entry.startedAt).getTime() + totalSecs * 1000);
-      body = { stoppedAt: newStop.toISOString() };
-    } else if (field === 'isBillable') {
-      body = { isBillable: value === 'true' };
-    }
+    pendingEdits.current.set(entry.id, patch.optimistic);
+    patchEntry(entry.id, patch.optimistic);
+
     try {
       const res = await fetch(`/api/time-entries/${entry.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(patch.body),
       });
-      if (!res.ok) throw new Error();
-      const updated = (await res.json()) as Partial<TimeEntry>;
-      setData((prev) =>
-        prev
-          ? { ...prev, entries: prev.entries.map((e) => (e.id === entry.id ? { ...e, ...updated } : e)) }
-          : prev,
-      );
+      if (!res.ok) throw new Error(`Save failed: ${res.status}`);
+      const updated = (await res.json()) as TimeEntry;
+
+      const reconciled: Partial<TimeEntry> = {
+        description: updated.description,
+        projectId: updated.projectId,
+        project: resolveProject(updated.projectId) ?? updated.project,
+        startedAt: updated.startedAt,
+        stoppedAt: updated.stoppedAt,
+        durationSeconds: updated.durationSeconds,
+        isBillable: updated.isBillable,
+      };
+      pendingEdits.current.set(entry.id, reconciled);
+      patchEntry(entry.id, reconciled);
       setRowStates((prev) => ({ ...prev, [entry.id]: 'saved' }));
       setTimeout(() => setRowStates((prev) => ({ ...prev, [entry.id]: 'idle' })), 1500);
-    } catch {
+
+      // Re-run the report so the aggregates match the entry list again.
+      const refreshed = await fetchReport({ silent: true });
+      pendingEdits.current.delete(entry.id);
+      if (!refreshed) {
+        // A patched entry beside stale aggregates is the bug this exists to remove, so
+        // put the row back and say the report is out of date.
+        patchEntry(entry.id, before);
+        setRefreshError(
+          'Your change was saved, but the report could not be refreshed — the figures shown are out of date.',
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      pendingEdits.current.delete(entry.id);
+      patchEntry(entry.id, before);
       setRowStates((prev) => ({ ...prev, [entry.id]: 'error' }));
       setTimeout(() => setRowStates((prev) => ({ ...prev, [entry.id]: 'idle' })), 2000);
     }
@@ -590,7 +792,6 @@ export default function ReportsPage() {
         dateRange,
         entries: data.entries,
         byDay: data.byDay,
-        byProject: data.byProject,
         totals: {
           totalSeconds: data.totals.totalSeconds,
           billableSeconds: data.totals.billableSeconds,
@@ -618,6 +819,7 @@ export default function ReportsPage() {
       ['Project', 'Client', 'Member', 'Date', 'Duration (h)', 'Billable', 'Amount'],
     ];
     for (const entry of data.entries) {
+      const cur = entry.project?.client?.currency ?? 'USD';
       rows.push([
         entry.project?.name ?? 'No Project',
         entry.project?.client?.name ?? '',
@@ -625,9 +827,7 @@ export default function ReportsPage() {
         format(new Date(entry.startedAt), 'yyyy-MM-dd'),
         ((entry.durationSeconds ?? 0) / 3600).toFixed(2),
         entry.isBillable ? 'Yes' : 'No',
-        entry.isBillable && entry.project
-          ? (((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)).toFixed(2)
-          : '0',
+        fromMinor(entryRevenueMinor(entry), cur).toFixed(currencyDecimals(cur)),
       ]);
     }
     downloadCSV(rows, 'ora-summary.csv');
@@ -639,6 +839,7 @@ export default function ReportsPage() {
       ['Date', 'Member', 'Client', 'Project', 'Description', 'Start', 'End', 'Duration (h)', 'Billable', 'Amount'],
     ];
     for (const entry of sortedEntries) {
+      const cur = entry.project?.client?.currency ?? 'USD';
       rows.push([
         format(new Date(entry.startedAt), 'yyyy-MM-dd'),
         entry.user.name ?? '',
@@ -649,9 +850,7 @@ export default function ReportsPage() {
         entry.stoppedAt ? fmtTime(entry.stoppedAt) : '',
         ((entry.durationSeconds ?? 0) / 3600).toFixed(2),
         entry.isBillable ? 'Yes' : 'No',
-        entry.isBillable && entry.project
-          ? (((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)).toFixed(2)
-          : '0',
+        fromMinor(entryRevenueMinor(entry), cur).toFixed(currencyDecimals(cur)),
       ]);
     }
     downloadCSV(rows, 'ora-detailed.csv');
@@ -807,6 +1006,19 @@ export default function ReportsPage() {
           )}
         </div>
       </div>
+
+      {/* Stale-report warning: the edit landed, the refresh didn't */}
+      {refreshError && (
+        <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg border border-amber-800/60 bg-amber-950/40 text-sm text-amber-200">
+          <span>{refreshError}</span>
+          <button
+            onClick={() => void fetchReport()}
+            className="px-3 py-1 rounded-md border border-amber-700/70 text-amber-100 hover:bg-amber-900/40 transition-colors whitespace-nowrap"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Save report modal */}
       {showSaveModal && (
@@ -1063,10 +1275,7 @@ export default function ReportsPage() {
                   {data.byProject.map((proj) => {
                     const key = proj.projectId ?? '__none__';
                     const isExpanded = expandedProjects.has(key);
-                    const pct =
-                      data.totals.totalSeconds > 0
-                        ? ((proj.totalSeconds / data.totals.totalSeconds) * 100).toFixed(1)
-                        : '0.0';
+                    const pct = (breakdownPcts.project.get(key) ?? 0).toFixed(1);
                     return (
                       <React.Fragment key={key}>
                         <tr
@@ -1103,10 +1312,9 @@ export default function ReportsPage() {
                         </tr>
                         {isExpanded &&
                           proj.members.map((member) => {
-                            const memberPct =
-                              proj.totalSeconds > 0
-                                ? ((member.totalSeconds / proj.totalSeconds) * 100).toFixed(1)
-                                : '0.0';
+                            const memberPct = (
+                              breakdownPcts.member.get(`${key}-${member.userId}`) ?? 0
+                            ).toFixed(1);
                             return (
                               <tr key={`${key}-${member.userId}`} className="border-b border-slate-800/30 bg-slate-900/50">
                                 <td className="px-4 py-2.5 pl-12">
@@ -1138,7 +1346,9 @@ export default function ReportsPage() {
                     <td className="px-4 py-3 text-right text-white">
                       {fmtHours(data.totals.totalSeconds)}
                     </td>
-                    <td className="px-4 py-3 text-right text-slate-400 hidden sm:table-cell">100%</td>
+                    <td className="px-4 py-3 text-right text-slate-400 hidden sm:table-cell">
+                      {breakdownPcts.total.toFixed(1)}%
+                    </td>
                     <td className="px-4 py-3 text-right text-white">
                       {formatGroupedAmounts(groupCurrencyTotals(data.byProject))}
                     </td>
@@ -1214,10 +1424,7 @@ export default function ReportsPage() {
                     {pagedEntries.map((entry) => {
                       const rowState = rowStates[entry.id] ?? 'idle';
                       const isEditing = editingCell?.entryId === entry.id;
-                      const amount =
-                        entry.isBillable && entry.project
-                          ? ((entry.durationSeconds ?? 0) / 3600) * Number(entry.project.hourlyRate)
-                          : 0;
+                      const amtMinor = entryRevenueMinor(entry);
 
                       let rowCls = 'border-b border-slate-800/60 ';
                       if (rowState === 'saved') rowCls += 'bg-emerald-950/40 transition-colors';
@@ -1391,8 +1598,8 @@ export default function ReportsPage() {
 
                           {/* Amount */}
                           <td className="px-4 py-3 text-slate-200 text-right whitespace-nowrap">
-                            {amount > 0 ? (
-                              formatCurrency(amount, entry.project?.client?.currency ?? 'USD')
+                            {amtMinor > 0 ? (
+                              formatMinor(amtMinor, entry.project?.client?.currency ?? 'USD')
                             ) : (
                               <span className="text-slate-600">—</span>
                             )}
