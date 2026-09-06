@@ -202,8 +202,6 @@ model TimePeriod {
   approvedAt     DateTime?
   approvedBy     String?
   publishedAt    DateTime?
-  qboInvoiceId   String?
-  xeroInvoiceId  String?
   reportPdfUrl   String?
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
@@ -276,15 +274,30 @@ model Invoice {
   clientId       String
   invoiceNumber  String
   amount         Decimal
-  currency       String       @default("USD")
+  currency       String        @default("USD")
+  status         InvoiceStatus @default(PENDING)
+  qboInvoiceId   String?
+  xeroInvoiceId  String?
+  failureReason  String?
+  issuedAt       DateTime?
   pdfUrl         String?
   pdfData        Bytes?
-  createdAt      DateTime     @default(now())
+  createdAt      DateTime      @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id])
   period       TimePeriod?  @relation(fields: [periodId], references: [id])
   client       Client       @relation(fields: [clientId], references: [id])
 
+  // The ledger's backbone: one invoice per client per period, enforced by the
+  // database so a retry cannot double-bill. periodId is nullable and Postgres
+  // treats NULLs as distinct, so ad-hoc invoices are unconstrained.
+  @@unique([periodId, clientId])
   @@index([organizationId])
   @@map("invoices")
+}
+
+enum InvoiceStatus {
+  PENDING
+  ISSUED
+  FAILED
 }

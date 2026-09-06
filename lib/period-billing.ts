@@ -121,3 +121,36 @@ export function analyzePeriodBilling(entries: BillingEntryLike[]): PeriodBilling
     conflict: null,
   };
 }
+
+/**
+ * Partition a period's billable entries into one group per client. This is the
+ * unit that becomes an invoice: a period holds work for any number of clients,
+ * and publishing fans out into one document per client rather than collapsing
+ * them into one.
+ */
+export function sliceEntriesByClient<T extends BillingEntryLike>(
+  entries: T[],
+): { client: BillingClient; entries: T[] }[] {
+  const groups = new Map<string, { client: BillingClient; entries: T[] }>();
+
+  for (const e of billableOnly(entries)) {
+    const c = e.project?.client ?? null;
+    const key = c?.id ?? '__no_client__';
+    if (!groups.has(key)) {
+      groups.set(key, {
+        client: {
+          id: c?.id ?? null,
+          name: c?.name ?? NO_CLIENT,
+          currency: c?.currency ?? null,
+          seconds: 0,
+        },
+        entries: [],
+      });
+    }
+    const g = groups.get(key)!;
+    g.client.seconds += e.durationSeconds ?? 0;
+    g.entries.push(e);
+  }
+
+  return [...groups.values()].sort((a, b) => b.client.seconds - a.client.seconds);
+}

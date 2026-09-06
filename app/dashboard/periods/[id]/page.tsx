@@ -5,7 +5,7 @@ import { useSession } from 'next-auth/react';
 import { formatDuration, formatCurrency } from '@/lib/utils';
 import { groupCurrencyTotals, formatGroupedAmounts } from '@/lib/currency';
 import { format } from 'date-fns';
-import { CheckCircle, Clock, AlertCircle, Download } from 'lucide-react';
+import { CheckCircle, Clock, AlertCircle } from 'lucide-react';
 import { ProjectIconOrDot } from '@/components/ui/ProjectIconOrDot';
 import { SiQuickbooks, SiXero } from 'react-icons/si';
 import { OriginButton } from '@/components/ui/origin-button';
@@ -51,6 +51,34 @@ interface Period {
     invoiceable: boolean;
     conflict: { kind: string; message: string } | null;
   };
+  clientRows?: ClientRow[];
+  publishState?: 'nothing_to_invoice' | 'unpublished' | 'partial' | 'published';
+  issuedCount?: number;
+  clientCount?: number;
+}
+
+interface ClientRow {
+  clientId: string | null;
+  clientName: string;
+  currency: string | null;
+  seconds: number;
+  amount: number;
+  invoice: {
+    invoiceNumber: string;
+    status: 'PENDING' | 'ISSUED' | 'FAILED';
+    qboInvoiceId: string | null;
+    xeroInvoiceId: string | null;
+    failureReason: string | null;
+    issuedAt: string | null;
+  } | null;
+}
+
+interface PublishResult {
+  clientId: string;
+  clientName: string;
+  outcome: 'issued' | 'recovered' | 'skipped_already_invoiced' | 'failed';
+  invoiceNumber?: string;
+  error?: string;
 }
 
 type StatusKey = Period['status'];
@@ -73,7 +101,6 @@ export default function PeriodDetailPage() {
   const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [tab, setTab] = useState<'summary' | 'entries'>('summary');
-  const [invoiceLoading, setInvoiceLoading] = useState(false);
   const [invoiceGenerated, setInvoiceGenerated] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -86,6 +113,11 @@ export default function PeriodDetailPage() {
 
   const [successMsg, setSuccessMsg] = useState('');
   const [showAllBillingClients, setShowAllBillingClients] = useState(false);
+  const [publishResults, setPublishResults] = useState<PublishResult[] | null>(null);
+  const [confirmLive, setConfirmLive] = useState<{
+    provider: 'qbo' | 'xero'; destination: string; clients: string[]; invoiceCount: number;
+  } | null>(null);
+  const [busyClient, setBusyClient] = useState<string | null>(null);
 
   const doAction = async (url: string, method = 'PATCH') => {
     setActionLoading(true);
@@ -96,21 +128,65 @@ export default function PeriodDetailPage() {
     if (!res.ok) {
       setMessage(data.error || data.message || 'Action failed');
     } else {
-      if (data.pdfAttached === true) setSuccessMsg('Invoice created + PDF attached');
-      else if (data.pdfAttached === false) setSuccessMsg('Invoice created (PDF attachment failed)');
       await load();
     }
     setActionLoading(false);
   };
 
-  const handleGenerateInvoice = async () => {
-    setInvoiceLoading(true);
+  /**
+   * Publishing fans the period out into one invoice per client. A live
+   * destination answers 428 first, so the confirmation names where the invoices
+   * would land and for whom before anything is created.
+   */
+  const doPublish = async (provider: 'qbo' | 'xero', confirmed = false) => {
+    setActionLoading(true);
+    setMessage('');
+    setSuccessMsg('');
+    setPublishResults(null);
+    try {
+      const res = await fetch(`/api/periods/${id}/publish/${provider}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(confirmed ? { confirmLive: true } : {}),
+      });
+      const data = await res.json();
+
+      if (res.status === 428) {
+        setConfirmLive({
+          provider,
+          destination: data.destination,
+          clients: data.clients ?? [],
+          invoiceCount: data.invoiceCount ?? 0,
+        });
+        return;
+      }
+      setConfirmLive(null);
+      if (!res.ok) {
+        setMessage(data.error || 'Publish failed');
+        return;
+      }
+      setPublishResults(data.results ?? []);
+      setSuccessMsg(data.message ?? 'Published');
+      await load();
+    } catch {
+      setMessage('Network error while publishing');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleGenerateInvoice = async (clientId: string, clientName: string) => {
+    setBusyClient(clientId);
     setMessage('');
     try {
-      const res = await fetch(`/api/periods/${id}/generate-invoice`, { method: 'POST' });
+      const res = await fetch(`/api/periods/${id}/generate-invoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId }),
+      });
       if (!res.ok) {
         const data = await res.json();
-        setMessage(data.error || 'Failed to generate invoice');
+        setMessage(data.error || `Failed to generate the invoice for ${clientName}`);
         return;
       }
       const invNum = res.headers.get('X-Invoice-Number') || 'invoice';
@@ -122,10 +198,31 @@ export default function PeriodDetailPage() {
       a.click();
       URL.revokeObjectURL(url);
       setInvoiceGenerated(invNum);
+      await load();
     } catch {
-      setMessage('Failed to generate invoice');
+      setMessage(`Failed to generate the invoice for ${clientName}`);
     } finally {
-      setInvoiceLoading(false);
+      setBusyClient(null);
+    }
+  };
+
+  const handleAttachPdf = async (clientId: string, clientName: string) => {
+    setBusyClient(clientId);
+    setMessage('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`/api/periods/${id}/attach-pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId }),
+      });
+      const data = await res.json();
+      if (!res.ok) setMessage(data.error || `Failed to attach the timesheet for ${clientName}`);
+      else setSuccessMsg(`Timesheet attached to ${data.invoiceNumber} for ${clientName}`);
+    } catch {
+      setMessage(`Failed to attach the timesheet for ${clientName}`);
+    } finally {
+      setBusyClient(null);
     }
   };
 
@@ -133,6 +230,8 @@ export default function PeriodDetailPage() {
   if (!period) return <div className="p-8" style={{ color: 'var(--text-muted)' }}>Period not found</div>;
 
   const totalSeconds = period.stats?.totalSeconds ?? (period.entries ?? []).reduce((s, e) => s + (e.durationSeconds || 0), 0);
+  // Clients still without an issued invoice - what a publish would actually do.
+  const remainingCount = (period.clientRows ?? []).filter((r) => r.invoice?.status !== 'ISSUED').length;
   const totalAmount = period.stats?.totalBillableAmount ?? 0;
   const s = STATUS_LABEL[period.status];
 
@@ -259,34 +358,31 @@ export default function PeriodDetailPage() {
             <CheckCircle className="w-4 h-4" /> Approve Period
           </OriginButton>
         )}
-        {period.status === 'APPROVED' && isAdmin && (
+        {(period.status === 'APPROVED' || period.status === 'PUBLISHED') && isAdmin && (
           <>
             <OriginButton
-              onClick={() => doAction(`/api/periods/${id}/publish/qbo`, 'POST')}
-              disabled={actionLoading || period.billing?.invoiceable === false}
-              title={period.billing?.conflict?.message}
+              onClick={() => doPublish('qbo')}
+              disabled={actionLoading || remainingCount === 0}
+              title={remainingCount === 0 ? 'Every client in this period is already invoiced' : undefined}
               className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
               style={{ background: '#15803d' }}
             >
-              <SiQuickbooks size={16} /> Publish to QuickBooks
+              <SiQuickbooks size={16} />
+              {remainingCount > 0 && remainingCount < (period.clientCount ?? 0)
+                ? `Publish remaining (${remainingCount}) to QuickBooks`
+                : 'Publish to QuickBooks'}
             </OriginButton>
             <OriginButton
-              onClick={() => doAction(`/api/periods/${id}/publish/xero`, 'POST')}
-              disabled={actionLoading || period.billing?.invoiceable === false}
-              title={period.billing?.conflict?.message}
+              onClick={() => doPublish('xero')}
+              disabled={actionLoading || remainingCount === 0}
+              title={remainingCount === 0 ? 'Every client in this period is already invoiced' : undefined}
               className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
               style={{ background: '#0369a1' }}
             >
-              <SiXero size={16} /> Publish to Xero
-            </OriginButton>
-            <OriginButton
-              onClick={handleGenerateInvoice}
-              disabled={invoiceLoading || period.billing?.invoiceable === false}
-              title={period.billing?.conflict?.message}
-              className="flex items-center gap-2 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
-              style={{ background: '#4338ca' }}
-            >
-              <Download className="w-4 h-4" /> {invoiceLoading ? 'Generating…' : 'Download Invoice PDF'}
+              <SiXero size={16} />
+              {remainingCount > 0 && remainingCount < (period.clientCount ?? 0)
+                ? `Publish remaining (${remainingCount}) to Xero`
+                : 'Publish to Xero'}
             </OriginButton>
           </>
         )}
@@ -296,6 +392,141 @@ export default function PeriodDetailPage() {
           </div>
         )}
       </div>
+
+      {/* Live-publish confirmation. Xero has no sandbox, so this appears on
+          every Xero publish; QuickBooks raises it only in production. */}
+      {confirmLive && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-slate-900 border border-amber-700 rounded-xl p-6 w-full max-w-lg shadow-2xl">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <h2 className="text-white font-medium">Publish to a live accounting system?</h2>
+                <p className="text-sm text-slate-300 mt-2">
+                  This creates <strong className="text-white">{confirmLive.invoiceCount}</strong>{' '}
+                  invoice{confirmLive.invoiceCount === 1 ? '' : 's'} in {confirmLive.destination}.
+                </p>
+                <p className="text-xs text-slate-400 mt-3 break-words">
+                  {confirmLive.clients.join(' · ')}
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 mt-6">
+              <button
+                onClick={() => setConfirmLive(null)}
+                className="px-4 py-2 text-sm rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { const provider = confirmLive.provider; setConfirmLive(null); void doPublish(provider, true); }}
+                className="px-4 py-2 text-sm rounded-lg text-white"
+                style={{ background: '#b45309' }}
+              >
+                Create {confirmLive.invoiceCount} invoice{confirmLive.invoiceCount === 1 ? '' : 's'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* One row per client: what each is owed and where its invoice stands.
+          Failure reasons render inline, since they are the actionable part. */}
+      {isAdmin && (period.clientRows?.length ?? 0) > 0 && (
+        <div className="mb-8 rounded-xl overflow-hidden border" style={{ borderColor: 'var(--border)' }}>
+          <div className="flex items-center justify-between px-4 py-3" style={{ background: 'var(--surface)' }}>
+            <span className="text-sm" style={{ color: 'var(--text)' }}>Invoices by client</span>
+            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              {period.issuedCount ?? 0} of {period.clientCount ?? 0} issued
+            </span>
+          </div>
+          <table className="w-full text-sm">
+            <tbody>
+              {(period.clientRows ?? []).map((row) => {
+                const inv = row.invoice;
+                const issued = inv?.status === 'ISSUED';
+                const failed = inv?.status === 'FAILED';
+                const providerId = inv?.qboInvoiceId ?? inv?.xeroInvoiceId ?? null;
+                return (
+                  <tr key={row.clientId ?? '__none__'} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                    <td className="px-4 py-3" style={{ color: 'var(--text)' }}>
+                      <div>{row.clientName}</div>
+                      {failed && inv?.failureReason && (
+                        <div className="text-xs text-red-400 mt-1 break-words max-w-xl">
+                          {inv.failureReason}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
+                      {formatDuration(row.seconds)}
+                    </td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap" style={{ color: 'var(--text)' }}>
+                      {row.currency ? formatCurrency(row.amount, row.currency) : '—'}
+                    </td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                      {issued ? (
+                        <span className="text-xs text-emerald-400">Issued · {inv!.invoiceNumber}</span>
+                      ) : failed ? (
+                        <span className="text-xs text-red-400">Failed · {inv!.invoiceNumber}</span>
+                      ) : (
+                        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Not yet published</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                      {row.clientId && (
+                        <div className="flex items-center justify-end gap-3">
+                          <button
+                            onClick={() => handleGenerateInvoice(row.clientId!, row.clientName)}
+                            disabled={busyClient === row.clientId}
+                            className="text-xs underline disabled:opacity-50"
+                            style={{ color: 'var(--text-secondary)' }}
+                          >
+                            {busyClient === row.clientId ? 'Working…' : 'Invoice PDF'}
+                          </button>
+                          {issued && providerId && !providerId.startsWith('QBO-DEMO-') && (
+                            <button
+                              onClick={() => handleAttachPdf(row.clientId!, row.clientName)}
+                              disabled={busyClient === row.clientId}
+                              className="text-xs underline disabled:opacity-50"
+                              style={{ color: 'var(--text-secondary)' }}
+                              title="Generate this timesheet and attach it to the issued invoice"
+                            >
+                              Attach timesheet
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Outcome of the last publish run, per client. */}
+      {publishResults && publishResults.length > 0 && (
+        <div className="mb-8 rounded-lg border px-4 py-3 text-sm" style={{ borderColor: 'var(--border)' }}>
+          <p className="mb-2" style={{ color: 'var(--text)' }}>Last publish run</p>
+          <ul className="space-y-1">
+            {publishResults.map((r) => (
+              <li key={r.clientId} className="text-xs break-words" style={{ color: 'var(--text-secondary)' }}>
+                <span style={{ color: 'var(--text)' }}>{r.clientName}</span>
+                {' — '}
+                {r.outcome === 'issued' && <span className="text-emerald-400">issued {r.invoiceNumber}</span>}
+                {r.outcome === 'recovered' && (
+                  <span className="text-emerald-400">recovered {r.invoiceNumber} from an earlier attempt</span>
+                )}
+                {r.outcome === 'skipped_already_invoiced' && (
+                  <span style={{ color: 'var(--text-muted)' }}>already invoiced as {r.invoiceNumber}</span>
+                )}
+                {r.outcome === 'failed' && <span className="text-red-400">{r.error}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="flex gap-1 mb-6" style={{ borderBottom: '1px solid var(--border)' }}>
         {(['summary', 'entries'] as const).map((t) => (

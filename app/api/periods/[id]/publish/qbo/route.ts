@@ -2,12 +2,21 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
 import { getValidClient, qboApiBase } from '@/lib/qbo';
-import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
-import { generatePeriodPdf } from '@/lib/generate-period-pdf';
-import { analyzePeriodBilling } from '@/lib/period-billing';
+import { currencyDecimals, fromMinor, getCurrency } from '@/lib/currency';
+import { analyzePeriodBilling, sliceEntriesByClient } from '@/lib/period-billing';
+import { composeInvoice, hoursOf, ROUNDING_ADJUSTMENT_LABEL } from '@/lib/invoice-lines';
+import { claimSlice, markFailed, markIssued } from '@/lib/invoice-ledger';
+import { confirmationRequired, qboTarget } from '@/lib/publish-safety';
+import {
+  ClientResult,
+  describeRun,
+  summarise,
+  syncPeriodStatus,
+  TIME_BUDGET_MS,
+} from '@/lib/publish-run';
 
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
@@ -15,6 +24,8 @@ export async function POST(
     if (authz instanceof NextResponse) return authz;
     const sessionUser = { id: authz.userId, organizationId: authz.organizationId };
     const { id } = await params;
+
+    const body = (await req.json().catch(() => ({}))) as { confirmLive?: boolean };
 
     // ── load period with entries ─────────────────────────────────────────────
 
@@ -34,381 +45,367 @@ export async function POST(
 
     if (!period) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    if (period.status !== 'APPROVED') {
+    // PUBLISHED is allowed through so a partially published period can resume.
+    if (period.status !== 'APPROVED' && period.status !== 'PUBLISHED') {
       return NextResponse.json(
         { error: `Period must be APPROVED before publishing (current: ${period.status})` },
         { status: 400 },
       );
     }
 
-    if (period.qboInvoiceId) {
+    // ── slice into one invoice per client ────────────────────────────────────
+    // Each slice must itself be coherent: billable work on a project with no
+    // client has no customer to bill and is refused rather than filed under a
+    // placeholder.
+
+    const slices = sliceEntriesByClient(period.entries);
+
+    if (slices.length === 0) {
+      const billing = analyzePeriodBilling(period.entries);
       return NextResponse.json(
-        { error: 'Invoice already published to QuickBooks', invoiceId: period.qboInvoiceId },
+        { error: billing.conflict?.message ?? 'Nothing to invoice in this period.' },
         { status: 409 },
+      );
+    }
+
+    const orphan = slices.find((s) => !s.client.id || !s.client.currency);
+    if (orphan) {
+      const hours = (orphan.client.seconds / 3600).toFixed(2);
+      return NextResponse.json(
+        {
+          error:
+            `${hours}h of billable work in this period is on a project with no client, so it has ` +
+            'no customer to invoice and no currency to bill in. Assign the project to a client, then publish.',
+          conflict: 'no_client',
+        },
+        { status: 409 },
+      );
+    }
+
+    // ── live-publish confirmation ────────────────────────────────────────────
+    // QuickBooks has a sandbox; confirmation is only demanded when this would
+    // reach a company that bills real people.
+
+    const target = qboTarget();
+    if (target.isLive && !body.confirmLive) {
+      return NextResponse.json(
+        confirmationRequired(target, slices.map((s) => ({ name: s.client.name }))),
+        { status: 428 },
       );
     }
 
     // ── demo stub when credentials absent ────────────────────────────────────
 
     if (!process.env.INTUIT_CLIENT_ID) {
-      const stubId = `QBO-DEMO-${id}`;
-      await prisma.timePeriod.update({
-        where: { id },
-        data: { status: 'PUBLISHED', publishedAt: new Date(), qboInvoiceId: stubId },
-      });
+      const demoResults: ClientResult[] = [];
+      for (const slice of slices) {
+        const composition = composeInvoice(slice.entries, slice.client.currency!);
+        const claim = await claimSlice({
+          organizationId: sessionUser.organizationId,
+          periodId: id,
+          clientId: slice.client.id!,
+          provider: 'qbo',
+          currency: composition.currency,
+        });
+        if (claim.alreadyIssued) {
+          demoResults.push({
+            clientId: slice.client.id!,
+            clientName: slice.client.name,
+            outcome: 'skipped_already_invoiced',
+            invoiceNumber: claim.invoiceNumber,
+          });
+          continue;
+        }
+        const stubId = `QBO-DEMO-${claim.invoiceNumber}`;
+        await markIssued({
+          invoiceId: claim.invoiceId,
+          provider: 'qbo',
+          providerInvoiceId: stubId,
+          amountMajor: fromMinor(composition.totalMinor, composition.currency),
+          currency: composition.currency,
+        });
+        demoResults.push({
+          clientId: slice.client.id!,
+          clientName: slice.client.name,
+          outcome: 'issued',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: stubId,
+          amount: fromMinor(composition.totalMinor, composition.currency),
+          currency: composition.currency,
+        });
+      }
+      await syncPeriodStatus(id, slices.length);
       return NextResponse.json({
         ok: true,
-        invoiceId: stubId,
+        demo: true,
         message: 'Demo mode — add INTUIT_CLIENT_ID to enable real QuickBooks publishing.',
+        summary: summarise(demoResults, []),
+        results: demoResults,
+        remaining: [],
+        stoppedEarly: false,
       });
     }
 
-    // ── get valid (auto-refreshed) OAuth client ──────────────────────────────
+    // ── QuickBooks client ────────────────────────────────────────────────────
 
     const { client, realmId } = await getValidClient(sessionUser.id);
     const base = qboApiBase(realmId);
     const token = client.getToken().access_token;
-
     const headers = {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
       Accept: 'application/json',
     };
 
-    // ── resolve the one client and currency this invoice bills ───────────────
-    // A QBO invoice is one document filed under one Customer in one currency.
-    // Refused rather than resolved by picking a winner: publishing a period
-    // that spans clients would file everyone else's work under the first
-    // client's customer record, in the first client's currency.
-
-    const billing = analyzePeriodBilling(period.entries);
-    if (!billing.invoiceable) {
-      return NextResponse.json(
-        {
-          error: billing.conflict!.message,
-          conflict: billing.conflict!.kind,
-          clients: billing.clients,
-          currencies: billing.currencies,
-        },
-        { status: 409 },
-      );
-    }
-
-    const clientCurrency: string = billing.currency!.toUpperCase();
-    const currency = clientCurrency;
-
-    // ── group billable entries by project ────────────────────────────────────
-    // Money is rounded once per time entry into integer minor units — the same
-    // leaf the Reports aggregation uses — so the invoice total reconciles
-    // exactly with the report for the same entries.
-
-    type LineGroup = {
-      projectName: string;
-      clientName: string | null;
-      qboCustomerId: string | null;
-      currency: string; // this line's own client's currency, never a sibling's
-      seconds: number;
-      rateHundredths: number;
-      amountMinor: number; // Σ per-entry minor units
-    };
-
-    const byProject = new Map<string, LineGroup>();
-
-    for (const entry of period.entries) {
-      const key = entry.projectId ?? '__no_project__';
-      const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
-      const secs = entry.durationSeconds ?? 0;
-      // Derived per line from the project's own client. The guard above means
-      // these all agree, but the money is never computed against a currency
-      // borrowed from another line.
-      const lineCurrency = (entry.project?.client?.currency ?? currency).toUpperCase();
-
-      if (!byProject.has(key)) {
-        byProject.set(key, {
-          projectName: entry.project?.name ?? 'Time',
-          clientName: entry.project?.client?.name ?? null,
-          qboCustomerId: entry.project?.client?.qboCustomerId ?? null,
-          currency: lineCurrency,
-          seconds: 0,
-          rateHundredths,
-          amountMinor: 0,
-        });
-      }
-
-      const g = byProject.get(key)!;
-      g.seconds += secs;
-      g.amountMinor += amountMinor(secs, rateHundredths, lineCurrency);
-    }
-
-    // ── resolve or create QBO Customer for each unique client ────────────────
+    const quote = (value: string) => value.replace(/'/g, "\\'");
 
     async function ensureCustomer(clientName: string, existingQboId: string | null): Promise<string> {
       if (existingQboId) return existingQboId;
 
-      // search first
+      const query = `SELECT * FROM Customer WHERE DisplayName = '${quote(clientName)}'`;
       const searchRes = await fetch(
-        `${base}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName = '${clientName.replace(/'/g, "\\'")}'`)}&minorversion=65`,
+        `${base}/query?query=${encodeURIComponent(query)}&minorversion=65`,
         { headers },
       );
-      const searchData = (await searchRes.json()) as { QueryResponse: { Customer?: { Id: string }[] } };
-      const existing = searchData.QueryResponse.Customer?.[0];
-      if (existing) return existing.Id;
+      if (searchRes.ok) {
+        const searchData = (await searchRes.json()) as { QueryResponse: { Customer?: { Id: string }[] } };
+        const existing = searchData.QueryResponse.Customer?.[0];
+        if (existing) return existing.Id;
+      }
 
-      // create
       const createRes = await fetch(`${base}/customer?minorversion=65`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ DisplayName: clientName }),
       });
+      if (!createRes.ok) {
+        const detail = (await createRes.text()).slice(0, 200);
+        throw new Error(`QuickBooks could not create the customer "${clientName}": ${detail}`);
+      }
       const createData = (await createRes.json()) as { Customer: { Id: string } };
       return createData.Customer.Id;
     }
 
-    // ── build Invoice Line items ─────────────────────────────────────────────
-
-    // The invoice's customer is the period's one client, established by the
-    // guard above — not "whichever group sorted first". There is deliberately
-    // no catch-all fallback customer: work with no client is refused earlier
-    // rather than filed under a placeholder.
-    const invoiceClient = period.entries.find(
-      (e) => e.project?.client?.id === billing.client!.id,
-    )!.project!.client!;
-
-    const primaryCustomerId = await ensureCustomer(
-      invoiceClient.name,
-      invoiceClient.qboCustomerId ?? null,
-    );
-
-    // persist QBO customer ID back to the Client record if we resolved it
-    if (!invoiceClient.qboCustomerId) {
-      await prisma.client.update({
-        where: { id: invoiceClient.id },
-        data: { qboCustomerId: primaryCustomerId },
-      });
-    }
-
-    const currencyMeta = getCurrency(currency);
-    const decimals = currencyDecimals(currency);
-
-    // Each product line foots against its own Qty × UnitPrice: Qty is the exact
-    // hours (never rounded before the multiply, printed at the precision that
-    // makes the arithmetic check out) and Amount is round(hours × rate).
-    const groups = Array.from(byProject.values());
-    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, g.currency);
-
-    const lines = groups.map((g, i) => {
-      const qty = parseFloat((g.seconds / 3600).toFixed(6));
-      const unitPrice = g.rateHundredths / 100; // Decimal(10,2) — exact
-      return {
-        Id: String(i + 1),
-        LineNum: i + 1,
-        Description: `${g.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitPrice.toFixed(decimals)}/hr`,
-        Amount: fromMinor(lineFootMinor(g), g.currency),
-        DetailType: 'SalesItemLineDetail',
-        SalesItemLineDetail: {
-          Qty: qty,
-          UnitPrice: unitPrice,
-          ItemRef: { value: '1', name: 'Services' },
-        },
-      };
-    });
-
-    // The invoice total must equal the report total for the same entries
-    // (Σ per-entry minor units). Per-entry rounding can leave the product lines
-    // a few minor units away from that, so the difference goes on its own
-    // disclosed line rather than distorting a product line.
-    const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
-    const linesMinor = groups.reduce((s, g) => s + lineFootMinor(g), 0);
-    const adjMinor = reportMinor - linesMinor;
-    if (adjMinor !== 0) {
-      const adjAmount = fromMinor(adjMinor, currency);
-      lines.push({
-        Id: String(lines.length + 1),
-        LineNum: lines.length + 1,
-        Description: 'Rounding adjustment',
-        Amount: adjAmount,
-        DetailType: 'SalesItemLineDetail',
-        SalesItemLineDetail: {
-          Qty: 1,
-          UnitPrice: adjAmount,
-          ItemRef: { value: '1', name: 'Services' },
-        },
-      });
-    }
-
-    // ── resolve next DocNumber ────────────────────────────────────────────────
-
-    async function getNextDocNumber(): Promise<number> {
+    /**
+     * Did a previous attempt already land this document number at QuickBooks?
+     * This is what closes the window between creating the remote invoice and
+     * recording it locally — without it, a crash in between means a retry
+     * bills the client twice.
+     */
+    async function findByDocNumber(docNumber: string): Promise<string | null> {
       try {
-        const qRes = await fetch(
-          `${base}/query?query=${encodeURIComponent('SELECT * FROM Invoice ORDERBY DocNumber DESC MAXRESULTS 1')}&minorversion=65`,
+        const query = `SELECT * FROM Invoice WHERE DocNumber = '${quote(docNumber)}'`;
+        const res = await fetch(
+          `${base}/query?query=${encodeURIComponent(query)}&minorversion=65`,
           { headers },
         );
-        if (!qRes.ok) return 1001;
-        const qData = (await qRes.json()) as { QueryResponse: { Invoice?: { DocNumber: string }[] } };
-        const invoices = qData.QueryResponse.Invoice ?? [];
-        if (invoices.length === 0) return 1001;
-
-        // Find highest purely-numeric DocNumber
-        let highest = 0;
-        for (const inv of invoices) {
-          const n = parseInt(inv.DocNumber, 10);
-          if (!isNaN(n) && n > highest) highest = n;
-        }
-
-        // If the latest DocNumber wasn't numeric, query for the highest numeric one
-        if (highest === 0) {
-          const q2Res = await fetch(
-            `${base}/query?query=${encodeURIComponent('SELECT * FROM Invoice MAXRESULTS 100')}&minorversion=65`,
-            { headers },
-          );
-          if (q2Res.ok) {
-            const q2Data = (await q2Res.json()) as { QueryResponse: { Invoice?: { DocNumber: string }[] } };
-            for (const inv of q2Data.QueryResponse.Invoice ?? []) {
-              const n = parseInt(inv.DocNumber, 10);
-              if (!isNaN(n) && n > highest) highest = n;
-            }
-          }
-        }
-
-        return highest > 0 ? highest + 1 : 1001;
+        if (!res.ok) return null;
+        const data = (await res.json()) as { QueryResponse: { Invoice?: { Id: string }[] } };
+        return data.QueryResponse.Invoice?.[0]?.Id ?? null;
       } catch {
-        return 1001;
+        return null;
       }
     }
 
-    const nextDocNumber = await getNextDocNumber();
+    // ── publish, one client at a time ────────────────────────────────────────
 
-    // ── create QBO Invoice (with one DocNumber-collision retry) ──────────────
+    const startedAt = Date.now();
+    const results: ClientResult[] = [];
+    const remaining: { clientId: string; clientName: string }[] = [];
 
-    const periodNote = `Billing period ${period.startDate.toISOString().slice(0, 10)} – ${period.endDate.toISOString().slice(0, 10)}`;
+    for (const slice of slices) {
+      const clientId = slice.client.id!;
+      const clientName = slice.client.name;
 
-    async function attemptCreate(docNumber: number): Promise<Response> {
-      const invoicePayload: Record<string, unknown> = {
-        DocNumber: String(docNumber),
-        Line: lines,
-        CustomerRef: { value: primaryCustomerId },
-        TxnDate: new Date().toISOString().slice(0, 10),
-        PrivateNote: periodNote,
-      };
-
-      if (clientCurrency && clientCurrency !== 'USD') {
-        invoicePayload.CurrencyRef = { value: clientCurrency };
+      // Stop ourselves before the platform does, so a run is never killed
+      // mid-write.
+      if (Date.now() - startedAt > TIME_BUDGET_MS) {
+        remaining.push({ clientId, clientName });
+        continue;
       }
 
-      return fetch(`${base}/invoice?minorversion=65`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(invoicePayload),
-      });
-    }
+      const composition = composeInvoice(slice.entries, slice.client.currency!);
+      const currency = composition.currency;
 
-    let invoiceRes: Response;
-    try {
-      invoiceRes = await attemptCreate(nextDocNumber);
+      let claim;
+      try {
+        claim = await claimSlice({
+          organizationId: sessionUser.organizationId,
+          periodId: id,
+          clientId,
+          provider: 'qbo',
+          currency,
+        });
+      } catch (e) {
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'failed',
+          error: e instanceof Error ? e.message : 'Could not claim an invoice number',
+        });
+        continue;
+      }
 
-      // Retry once on DocNumber collision (race condition)
-      if (!invoiceRes.ok) {
-        const peek = await invoiceRes.text();
-        if (peek.toLowerCase().includes('docnumber') && peek.toLowerCase().includes('exist')) {
-          console.warn('[qbo publish] DocNumber collision, retrying with', nextDocNumber + 1);
-          invoiceRes = await attemptCreate(nextDocNumber + 1);
-          // Re-wrap the already-consumed body so the error path below can read it
-          if (!invoiceRes.ok) {
-            const errBody2 = await invoiceRes.text();
-            invoiceRes = new Response(errBody2, { status: invoiceRes.status, headers: invoiceRes.headers });
-          }
-        } else {
-          // Re-wrap the already-consumed body for the error handler below
-          invoiceRes = new Response(peek, { status: invoiceRes.status, headers: invoiceRes.headers });
+      if (claim.alreadyIssued) {
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'skipped_already_invoiced',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: claim.existingProviderId ?? undefined,
+        });
+        continue;
+      }
+
+      if (claim.needsReconcile) {
+        const found = await findByDocNumber(claim.invoiceNumber);
+        if (found) {
+          await markIssued({
+            invoiceId: claim.invoiceId,
+            provider: 'qbo',
+            providerInvoiceId: found,
+            amountMajor: fromMinor(composition.totalMinor, currency),
+            currency,
+          });
+          results.push({
+            clientId,
+            clientName,
+            outcome: 'recovered',
+            invoiceNumber: claim.invoiceNumber,
+            providerInvoiceId: found,
+            amount: fromMinor(composition.totalMinor, currency),
+            currency,
+          });
+          continue;
         }
       }
-    } catch (fetchErr) {
-      console.error('[qbo publish] invoice fetch error:', fetchErr);
-      return NextResponse.json({ error: 'Network error contacting QuickBooks' }, { status: 502 });
-    }
 
-    if (!invoiceRes.ok) {
-      const errBody = await invoiceRes.text();
-      console.error('[qbo publish] invoice create failed:', errBody);
+      try {
+        const existingCustomerId = slice.entries[0].project?.client?.qboCustomerId ?? null;
+        const customerId = await ensureCustomer(clientName, existingCustomerId);
+        if (!existingCustomerId) {
+          await prisma.client.update({
+            where: { id: clientId },
+            data: { qboCustomerId: customerId },
+          });
+        }
 
-      const lower = errBody.toLowerCase();
-      const isCurrencyError =
-        lower.includes('multicurrency') ||
-        lower.includes('currency') ||
-        /"errorcode"\s*:\s*"?(2500|6000)"?/i.test(errBody);
+        const currencyMeta = getCurrency(currency);
+        const decimals = currencyDecimals(currency);
 
-      if (isCurrencyError) {
-        const currencyLabel = clientCurrency ?? 'a non-USD currency';
-        return NextResponse.json(
-          {
-            error: `This client is billed in ${currencyLabel} but your QuickBooks company does not have multicurrency enabled. Please enable it in QBO under Settings → Advanced → Currency, then try again.`,
-          },
-          { status: 422 },
-        );
+        const lines = composition.lines.map((line, i) => {
+          const qty = hoursOf(line.seconds);
+          const unitPrice = line.rateHundredths / 100;
+          return {
+            Id: String(i + 1),
+            LineNum: i + 1,
+            Description: `${line.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitPrice.toFixed(decimals)}/hr`,
+            Amount: fromMinor(line.lineFootMinor, currency),
+            DetailType: 'SalesItemLineDetail',
+            SalesItemLineDetail: {
+              Qty: qty,
+              UnitPrice: unitPrice,
+              ItemRef: { value: '1', name: 'Services' },
+            },
+          };
+        });
+
+        if (composition.adjustmentMinor !== 0) {
+          const adjAmount = fromMinor(composition.adjustmentMinor, currency);
+          lines.push({
+            Id: String(lines.length + 1),
+            LineNum: lines.length + 1,
+            Description: ROUNDING_ADJUSTMENT_LABEL,
+            Amount: adjAmount,
+            DetailType: 'SalesItemLineDetail',
+            SalesItemLineDetail: {
+              Qty: 1,
+              UnitPrice: adjAmount,
+              ItemRef: { value: '1', name: 'Services' },
+            },
+          });
+        }
+
+        const payload: Record<string, unknown> = {
+          DocNumber: claim.invoiceNumber,
+          Line: lines,
+          CustomerRef: { value: customerId },
+          TxnDate: new Date().toISOString().slice(0, 10),
+          PrivateNote:
+            `Billing period ${period.startDate.toISOString().slice(0, 10)} – ` +
+            `${period.endDate.toISOString().slice(0, 10)}`,
+        };
+        if (currency !== 'USD') payload.CurrencyRef = { value: currency };
+
+        const res = await fetch(`${base}/invoice?minorversion=65`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const errBody = await res.text();
+          const lower = errBody.toLowerCase();
+          const isCurrencyError =
+            lower.includes('multicurrency') ||
+            lower.includes('currency') ||
+            /"errorcode"\s*:\s*"?(2500|6000)"?/i.test(errBody);
+          const reason = isCurrencyError
+            ? `QuickBooks: ${clientName} is billed in ${currency} but multicurrency is not enabled. ` +
+              'Enable it under Settings → Advanced → Currency, then retry.'
+            : `QuickBooks rejected the invoice: ${errBody.slice(0, 300)}`;
+          await markFailed(claim.invoiceId, reason);
+          results.push({
+            clientId,
+            clientName,
+            outcome: 'failed',
+            invoiceNumber: claim.invoiceNumber,
+            error: reason,
+          });
+          continue;
+        }
+
+        const data = (await res.json()) as { Invoice: { Id: string } };
+        await markIssued({
+          invoiceId: claim.invoiceId,
+          provider: 'qbo',
+          providerInvoiceId: data.Invoice.Id,
+          amountMajor: fromMinor(composition.totalMinor, currency),
+          currency,
+        });
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'issued',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: data.Invoice.Id,
+          amount: fromMinor(composition.totalMinor, currency),
+          currency,
+        });
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : 'Unexpected error contacting QuickBooks';
+        await markFailed(claim.invoiceId, reason);
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'failed',
+          invoiceNumber: claim.invoiceNumber,
+          error: reason,
+        });
       }
-
-      return NextResponse.json({ error: 'Failed to create QBO invoice', detail: errBody }, { status: 502 });
     }
 
-    const invoiceData = (await invoiceRes.json()) as { Invoice: { Id: string; DocNumber: string } };
-    const qboInvoiceId = invoiceData.Invoice.Id;
-    const docNumber = invoiceData.Invoice.DocNumber;
+    await syncPeriodStatus(id, slices.length);
 
-    // ── generate and attach PDF report ─────────────────────────────────────────
-
-    let pdfAttached = false;
-    try {
-      const pdfPeriod = {
-        ...period,
-        entries: period.entries.map((e: any) => ({
-          ...e,
-          project: e.project ? { ...e.project, hourlyRate: Number(e.project.hourlyRate) } : null,
-        })),
-      };
-      const pdfBuffer = await generatePeriodPdf(pdfPeriod as any, period.organization?.name);
-      const fileName = 'ORA-Time-Report.pdf';
-
-      const metadata = JSON.stringify({
-        AttachableRef: [{
-          EntityRef: { type: 'Invoice', value: qboInvoiceId },
-          IncludeOnSend: true,
-        }],
-        FileName: fileName,
-        ContentType: 'application/pdf',
-      });
-
-      const form = new FormData();
-      form.append('file_metadata', new Blob([metadata], { type: 'application/json' }), 'metadata');
-      form.append('file_content', new Blob([new Uint8Array(pdfBuffer)], { type: 'application/pdf' }), fileName);
-
-      const uploadRes = await fetch(`${base}/upload?minorversion=65`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-        body: form,
-      });
-
-      if (uploadRes.ok) {
-        pdfAttached = true;
-      } else {
-        console.error('[qbo publish] PDF upload failed:', await uploadRes.text());
-      }
-    } catch (pdfErr) {
-      console.error('[qbo publish] PDF generation/upload failed:', pdfErr);
-    }
-
-    // ── update TimePeriod ─────────────────────────────────────────────────────
-
-    await prisma.timePeriod.update({
-      where: { id },
-      data: {
-        status: 'PUBLISHED',
-        publishedAt: new Date(),
-        qboInvoiceId,
-      },
+    const summary = summarise(results, remaining);
+    return NextResponse.json({
+      ok: true,
+      summary,
+      results,
+      remaining,
+      stoppedEarly: remaining.length > 0,
+      message: describeRun(summary, remaining, 'QuickBooks'),
     });
-
-    return NextResponse.json({ ok: true, invoiceId: qboInvoiceId, docNumber, pdfAttached });
   } catch (err) {
     console.error('[periods/publish/qbo POST] error:', err);
     const message = err instanceof Error ? err.message : 'Internal server error';

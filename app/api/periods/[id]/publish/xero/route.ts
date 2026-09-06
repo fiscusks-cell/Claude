@@ -3,12 +3,21 @@ import { Invoice, LineItem, Contact, LineAmountTypes, CurrencyCode } from 'xero-
 import { prisma } from '@/lib/prisma';
 import { requireAuth } from '@/lib/authz';
 import { getValidXeroClient } from '@/lib/xero';
-import { amountMinor, currencyDecimals, fromMinor, getCurrency, rateToHundredths } from '@/lib/currency';
-import { generatePeriodPdf } from '@/lib/generate-period-pdf';
-import { analyzePeriodBilling } from '@/lib/period-billing';
+import { currencyDecimals, fromMinor, getCurrency } from '@/lib/currency';
+import { analyzePeriodBilling, sliceEntriesByClient } from '@/lib/period-billing';
+import { composeInvoice, hoursOf, ROUNDING_ADJUSTMENT_LABEL } from '@/lib/invoice-lines';
+import { claimSlice, markFailed, markIssued } from '@/lib/invoice-ledger';
+import { confirmationRequired, xeroTarget } from '@/lib/publish-safety';
+import {
+  ClientResult,
+  describeRun,
+  summarise,
+  syncPeriodStatus,
+  TIME_BUDGET_MS,
+} from '@/lib/publish-run';
 
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
@@ -16,6 +25,8 @@ export async function POST(
     if (authz instanceof NextResponse) return authz;
     const sessionUser = { id: authz.userId, organizationId: authz.organizationId };
     const { id } = await params;
+
+    const body = (await req.json().catch(() => ({}))) as { confirmLive?: boolean };
 
     // ── load period with billable entries ────────────────────────────────────
 
@@ -35,110 +46,126 @@ export async function POST(
 
     if (!period) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    if (period.status !== 'APPROVED') {
+    // PUBLISHED is allowed through so a partially published period can resume.
+    if (period.status !== 'APPROVED' && period.status !== 'PUBLISHED') {
       return NextResponse.json(
         { error: `Period must be APPROVED before publishing (current: ${period.status})` },
         { status: 400 },
       );
     }
 
-    if (period.xeroInvoiceId) {
+    // ── slice into one invoice per client ────────────────────────────────────
+
+    const slices = sliceEntriesByClient(period.entries);
+
+    if (slices.length === 0) {
+      const billing = analyzePeriodBilling(period.entries);
       return NextResponse.json(
-        { error: 'Invoice already published to Xero', invoiceId: period.xeroInvoiceId },
+        { error: billing.conflict?.message ?? 'Nothing to invoice in this period.' },
         { status: 409 },
+      );
+    }
+
+    const orphan = slices.find((s) => !s.client.id || !s.client.currency);
+    if (orphan) {
+      const hours = (orphan.client.seconds / 3600).toFixed(2);
+      return NextResponse.json(
+        {
+          error:
+            `${hours}h of billable work in this period is on a project with no client, so it has ` +
+            'no customer to invoice and no currency to bill in. Assign the project to a client, then publish.',
+          conflict: 'no_client',
+        },
+        { status: 409 },
+      );
+    }
+
+    // ── live-publish confirmation ────────────────────────────────────────────
+    // Unlike QuickBooks, Xero has no sandbox: every call reaches api.xero.com
+    // and writes into whichever organisation the stored token authorised, so
+    // confirmation is required on every publish rather than only in production.
+
+    const target = xeroTarget();
+    if (target.isLive && !body.confirmLive) {
+      return NextResponse.json(
+        confirmationRequired(target, slices.map((s) => ({ name: s.client.name }))),
+        { status: 428 },
       );
     }
 
     // ── demo stub when credentials absent ────────────────────────────────────
 
     if (!process.env.XERO_CLIENT_ID) {
-      const stubId = `XERO-DEMO-${id}`;
-      await prisma.timePeriod.update({
-        where: { id },
-        data: { status: 'PUBLISHED', publishedAt: new Date(), xeroInvoiceId: stubId },
-      });
+      const demoResults: ClientResult[] = [];
+      for (const slice of slices) {
+        const composition = composeInvoice(slice.entries, slice.client.currency!);
+        const claim = await claimSlice({
+          organizationId: sessionUser.organizationId,
+          periodId: id,
+          clientId: slice.client.id!,
+          provider: 'xero',
+          currency: composition.currency,
+        });
+        if (claim.alreadyIssued) {
+          demoResults.push({
+            clientId: slice.client.id!,
+            clientName: slice.client.name,
+            outcome: 'skipped_already_invoiced',
+            invoiceNumber: claim.invoiceNumber,
+          });
+          continue;
+        }
+        const stubId = `XERO-DEMO-${claim.invoiceNumber}`;
+        await markIssued({
+          invoiceId: claim.invoiceId,
+          provider: 'xero',
+          providerInvoiceId: stubId,
+          amountMajor: fromMinor(composition.totalMinor, composition.currency),
+          currency: composition.currency,
+        });
+        demoResults.push({
+          clientId: slice.client.id!,
+          clientName: slice.client.name,
+          outcome: 'issued',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: stubId,
+          amount: fromMinor(composition.totalMinor, composition.currency),
+          currency: composition.currency,
+        });
+      }
+      await syncPeriodStatus(id, slices.length);
       return NextResponse.json({
         ok: true,
-        invoiceId: stubId,
+        demo: true,
         message: 'Demo mode — add XERO_CLIENT_ID to enable real Xero publishing.',
+        summary: summarise(demoResults, []),
+        results: demoResults,
+        remaining: [],
+        stoppedEarly: false,
       });
     }
 
-    // ── get valid (auto-refreshed) Xero client ───────────────────────────────
+    // ── Xero client ──────────────────────────────────────────────────────────
 
     const { xero, tenantId } = await getValidXeroClient(sessionUser.id);
 
-    // ── resolve the one client and currency this invoice bills ───────────────
-    // A Xero invoice is one document for one Contact in one currency. Refused
-    // rather than resolved by picking a winner: publishing a period that spans
-    // clients would bill everyone else's work to the first client's contact,
-    // in the first client's currency.
-
-    const billing = analyzePeriodBilling(period.entries);
-    if (!billing.invoiceable) {
-      return NextResponse.json(
-        {
-          error: billing.conflict!.message,
-          conflict: billing.conflict!.kind,
-          clients: billing.clients,
-          currencies: billing.currencies,
-        },
-        { status: 409 },
-      );
+    // Which currencies the organisation can actually invoice in. Fetched once
+    // rather than per client; a failure here is non-fatal and Xero rejects the
+    // invoice itself if the currency is genuinely unusable.
+    let enabledCurrencies: string[] | null = null;
+    try {
+      const currRes = await xero.accountingApi.getCurrencies(tenantId);
+      enabledCurrencies = (currRes.body.currencies ?? []).map((c) => String(c.code ?? '').toUpperCase());
+    } catch {
+      enabledCurrencies = null;
     }
-
-    const clientCurrency: string = billing.currency!.toUpperCase();
-
-    // ── group billable entries by project ────────────────────────────────────
-    // Money is rounded once per time entry into integer minor units — the same
-    // leaf the Reports aggregation uses — so the invoice total reconciles
-    // exactly with the report for the same entries.
-
-    type LineGroup = {
-      projectName: string;
-      clientName: string | null;
-      xeroContactId: string | null;
-      currency: string; // this line's own client's currency, never a sibling's
-      seconds: number;
-      rateHundredths: number;
-      amountMinor: number; // Σ per-entry minor units
-    };
-
-    const byProject = new Map<string, LineGroup>();
-
-    for (const entry of period.entries) {
-      const key = entry.projectId ?? '__no_project__';
-      const rateHundredths = entry.project ? rateToHundredths(entry.project.hourlyRate) : 0;
-      const secs = entry.durationSeconds ?? 0;
-      // Derived per line from the project's own client. The guard above means
-      // these all agree, but the money is never computed against a currency
-      // borrowed from another line.
-      const lineCurrency = (entry.project?.client?.currency ?? clientCurrency).toUpperCase();
-
-      if (!byProject.has(key)) {
-        byProject.set(key, {
-          projectName: entry.project?.name ?? 'Time',
-          clientName: entry.project?.client?.name ?? null,
-          xeroContactId: entry.project?.client?.xeroContactId ?? null,
-          currency: lineCurrency,
-          seconds: 0,
-          rateHundredths,
-          amountMinor: 0,
-        });
-      }
-
-      const g = byProject.get(key)!;
-      g.seconds += secs;
-      g.amountMinor += amountMinor(secs, rateHundredths, lineCurrency);
-    }
-
-
-    // ── resolve or create Xero Contact ───────────────────────────────────────
 
     async function ensureContact(clientName: string, existingContactId: string | null): Promise<string> {
       if (existingContactId) return existingContactId;
 
-      const searchRes = await xero.accountingApi.getContacts(tenantId, undefined, `Name="${clientName}"`);
+      const searchRes = await xero.accountingApi.getContacts(
+        tenantId, undefined, `Name=="${clientName.replace(/"/g, '\\"')}"`,
+      );
       const found = searchRes.body.contacts?.[0];
       if (found?.contactID) return found.contactID;
 
@@ -146,186 +173,212 @@ export async function POST(
         contacts: [{ name: clientName }],
       });
       const contactId = createRes.body.contacts?.[0]?.contactID;
-      if (!contactId) throw new Error(`Failed to create Xero contact for "${clientName}"`);
+      if (!contactId) throw new Error(`Xero could not create a contact for "${clientName}"`);
       return contactId;
     }
 
-    // The invoice's contact is the period's one client, established by the guard
-    // above — not "whichever group sorted first". There is deliberately no
-    // catch-all fallback contact: work with no client is refused earlier rather
-    // than billed to a placeholder.
-    const invoiceClient = period.entries.find(
-      (e) => e.project?.client?.id === billing.client!.id,
-    )!.project!.client!;
-
-    const primaryClientName: string = invoiceClient.name;
-    const primaryContactId = await ensureContact(
-      invoiceClient.name,
-      invoiceClient.xeroContactId ?? null,
-    );
-
-    if (!invoiceClient.xeroContactId) {
-      await prisma.client.update({
-        where: { id: invoiceClient.id },
-        data: { xeroContactId: primaryContactId },
-      });
-    }
-
-    // ── build line items ─────────────────────────────────────────────────────
-
-    const currencyMeta = getCurrency(clientCurrency);
-    const rateDecimals = currencyDecimals(clientCurrency);
-
-    // Each product line foots against its own quantity × unitAmount: quantity is
-    // the exact hours (never rounded before the multiply, printed at the
-    // precision that makes the arithmetic check out) and lineAmount is
-    // round(hours × rate).
-    const groups = Array.from(byProject.values());
-    const lineFootMinor = (g: LineGroup) => amountMinor(g.seconds, g.rateHundredths, g.currency);
-
-    const lineItems: LineItem[] = groups.map((g) => {
-      const qty = parseFloat((g.seconds / 3600).toFixed(6));
-      const unitAmount = g.rateHundredths / 100; // Decimal(10,2) — exact
-      return {
-        description: `${g.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitAmount.toFixed(rateDecimals)}/hr`,
-        quantity: qty,
-        unitAmount,
-        accountCode: '200',
-        lineAmount: fromMinor(lineFootMinor(g), g.currency),
-      };
-    });
-
-    // The invoice total must equal the report total for the same entries
-    // (Σ per-entry minor units). Per-entry rounding can leave the product lines
-    // a few minor units away from that, so the difference goes on its own
-    // disclosed line rather than distorting a product line.
-    const reportMinor = groups.reduce((s, g) => s + g.amountMinor, 0);
-    const linesMinor = groups.reduce((s, g) => s + lineFootMinor(g), 0);
-    const adjMinor = reportMinor - linesMinor;
-    if (adjMinor !== 0) {
-      const adjAmount = fromMinor(adjMinor, clientCurrency);
-      lineItems.push({
-        description: 'Rounding adjustment',
-        quantity: 1,
-        unitAmount: adjAmount,
-        accountCode: '200',
-        lineAmount: adjAmount,
-      });
-    }
-
-    // ── validate currency is enabled in Xero ─────────────────────────────────
-
-    if (clientCurrency !== 'USD') {
+    /**
+     * Did a previous attempt already land this invoice number at Xero? This
+     * closes the window between creating the remote invoice and recording it
+     * locally — without it, a crash in between means a retry bills twice.
+     */
+    async function findByInvoiceNumber(invoiceNumber: string): Promise<string | null> {
       try {
-        const currRes = await xero.accountingApi.getCurrencies(tenantId);
-        const enabledCodes = (currRes.body.currencies ?? []).map(
-          (c) => String(c.code ?? '').toUpperCase(),
+        const res = await xero.accountingApi.getInvoices(
+          tenantId, undefined, `InvoiceNumber=="${invoiceNumber}"`,
         );
-        if (!enabledCodes.includes(clientCurrency)) {
-          return NextResponse.json(
-            {
-              error: `This client is billed in ${clientCurrency} but your Xero organisation does not have multicurrency enabled or ${clientCurrency} is not added as a currency.`,
-            },
-            { status: 422 },
-          );
-        }
+        return res.body.invoices?.[0]?.invoiceID ?? null;
       } catch {
-        // non-fatal — let Xero reject if currency is truly invalid
+        return null;
       }
     }
 
-    // ── determine next invoice number ────────────────────────────────────────
+    // ── publish, one client at a time ────────────────────────────────────────
 
-    let invoiceNumber: string | undefined;
-    try {
-      const existing = await xero.accountingApi.getInvoices(
-        tenantId, undefined, undefined, 'InvoiceNumber DESC', undefined, undefined, undefined, undefined, 1,
-      );
-      const lastNum = existing.body.invoices?.[0]?.invoiceNumber;
-      if (lastNum) {
-        const numPart = lastNum.replace(/\D/g, '');
-        const prefix = lastNum.replace(/\d+$/, '');
-        if (numPart) {
-          invoiceNumber = `${prefix}${String(parseInt(numPart, 10) + 1).padStart(numPart.length, '0')}`;
+    const startedAt = Date.now();
+    const results: ClientResult[] = [];
+    const remaining: { clientId: string; clientName: string }[] = [];
+
+    for (const slice of slices) {
+      const clientId = slice.client.id!;
+      const clientName = slice.client.name;
+
+      if (Date.now() - startedAt > TIME_BUDGET_MS) {
+        remaining.push({ clientId, clientName });
+        continue;
+      }
+
+      const composition = composeInvoice(slice.entries, slice.client.currency!);
+      const currency = composition.currency;
+
+      let claim;
+      try {
+        claim = await claimSlice({
+          organizationId: sessionUser.organizationId,
+          periodId: id,
+          clientId,
+          provider: 'xero',
+          currency,
+        });
+      } catch (e) {
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'failed',
+          error: e instanceof Error ? e.message : 'Could not claim an invoice number',
+        });
+        continue;
+      }
+
+      if (claim.alreadyIssued) {
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'skipped_already_invoiced',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: claim.existingProviderId ?? undefined,
+        });
+        continue;
+      }
+
+      if (claim.needsReconcile) {
+        const found = await findByInvoiceNumber(claim.invoiceNumber);
+        if (found) {
+          await markIssued({
+            invoiceId: claim.invoiceId,
+            provider: 'xero',
+            providerInvoiceId: found,
+            amountMajor: fromMinor(composition.totalMinor, currency),
+            currency,
+          });
+          results.push({
+            clientId,
+            clientName,
+            outcome: 'recovered',
+            invoiceNumber: claim.invoiceNumber,
+            providerInvoiceId: found,
+            amount: fromMinor(composition.totalMinor, currency),
+            currency,
+          });
+          continue;
         }
       }
-    } catch {
-      // fall through — let Xero auto-assign
-    }
 
-    // ── create Xero Invoice ───────────────────────────────────────────────────
+      try {
+        if (currency !== 'USD' && enabledCurrencies && !enabledCurrencies.includes(currency)) {
+          const reason =
+            `Xero: ${clientName} is billed in ${currency}, which is not enabled in your Xero ` +
+            'organisation. Add the currency (or enable multicurrency), then retry.';
+          await markFailed(claim.invoiceId, reason);
+          results.push({
+            clientId, clientName, outcome: 'failed',
+            invoiceNumber: claim.invoiceNumber, error: reason,
+          });
+          continue;
+        }
 
-    const contact: Contact = { contactID: primaryContactId };
-    if (primaryClientName) contact.name = primaryClientName;
+        const existingContactId = slice.entries[0].project?.client?.xeroContactId ?? null;
+        const contactId = await ensureContact(clientName, existingContactId);
+        if (!existingContactId) {
+          await prisma.client.update({
+            where: { id: clientId },
+            data: { xeroContactId: contactId },
+          });
+        }
 
-    const invoice: Invoice = {
-      type: Invoice.TypeEnum.ACCREC,
-      contact,
-      lineItems,
-      lineAmountTypes: LineAmountTypes.Exclusive,
-      date: new Date().toISOString().slice(0, 10),
-      dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
-      reference: `ORA-${id.slice(-8).toUpperCase()}`,
-      status: Invoice.StatusEnum.AUTHORISED,
-      ...(invoiceNumber && { invoiceNumber }),
-      ...(clientCurrency !== 'USD' && { currencyCode: clientCurrency as unknown as CurrencyCode }),
-    };
+        const currencyMeta = getCurrency(currency);
+        const decimals = currencyDecimals(currency);
 
-    let invoiceRes = await xero.accountingApi.createInvoices(tenantId, { invoices: [invoice] });
-    let created = invoiceRes.body.invoices?.[0];
+        const lineItems: LineItem[] = composition.lines.map((line) => {
+          const qty = hoursOf(line.seconds);
+          const unitAmount = line.rateHundredths / 100;
+          return {
+            description: `${line.projectName} — ${qty} hrs @ ${currencyMeta.symbol} ${unitAmount.toFixed(decimals)}/hr`,
+            quantity: qty,
+            unitAmount,
+            accountCode: '200',
+            lineAmount: fromMinor(line.lineFootMinor, currency),
+          };
+        });
 
-    // retry with incremented number if duplicate
-    if (!created?.invoiceID && invoiceNumber) {
-      const numPart = invoiceNumber.replace(/\D/g, '');
-      const prefix = invoiceNumber.replace(/\d+$/, '');
-      if (numPart) {
-        invoice.invoiceNumber = `${prefix}${String(parseInt(numPart, 10) + 1).padStart(numPart.length, '0')}`;
-        invoiceRes = await xero.accountingApi.createInvoices(tenantId, { invoices: [invoice] });
-        created = invoiceRes.body.invoices?.[0];
+        if (composition.adjustmentMinor !== 0) {
+          const adjAmount = fromMinor(composition.adjustmentMinor, currency);
+          lineItems.push({
+            description: ROUNDING_ADJUSTMENT_LABEL,
+            quantity: 1,
+            unitAmount: adjAmount,
+            accountCode: '200',
+            lineAmount: adjAmount,
+          });
+        }
+
+        const contact: Contact = { contactID: contactId, name: clientName };
+        const invoice: Invoice = {
+          type: Invoice.TypeEnum.ACCREC,
+          contact,
+          lineItems,
+          lineAmountTypes: LineAmountTypes.Exclusive,
+          date: new Date().toISOString().slice(0, 10),
+          dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+          reference: `ORA-${id.slice(-8).toUpperCase()}`,
+          status: Invoice.StatusEnum.AUTHORISED,
+          invoiceNumber: claim.invoiceNumber,
+          ...(currency !== 'USD' && { currencyCode: currency as unknown as CurrencyCode }),
+        };
+
+        const res = await xero.accountingApi.createInvoices(tenantId, { invoices: [invoice] });
+        const created = res.body.invoices?.[0];
+
+        if (!created?.invoiceID) {
+          const reason = `Xero rejected the invoice: ${JSON.stringify(res.body).slice(0, 300)}`;
+          await markFailed(claim.invoiceId, reason);
+          results.push({
+            clientId, clientName, outcome: 'failed',
+            invoiceNumber: claim.invoiceNumber, error: reason,
+          });
+          continue;
+        }
+
+        await markIssued({
+          invoiceId: claim.invoiceId,
+          provider: 'xero',
+          providerInvoiceId: created.invoiceID,
+          amountMajor: fromMinor(composition.totalMinor, currency),
+          currency,
+        });
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'issued',
+          invoiceNumber: claim.invoiceNumber,
+          providerInvoiceId: created.invoiceID,
+          amount: fromMinor(composition.totalMinor, currency),
+          currency,
+        });
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : 'Unexpected error contacting Xero';
+        await markFailed(claim.invoiceId, reason);
+        results.push({
+          clientId,
+          clientName,
+          outcome: 'failed',
+          invoiceNumber: claim.invoiceNumber,
+          error: reason,
+        });
       }
     }
 
-    if (!created?.invoiceID) {
-      const detail = JSON.stringify(invoiceRes.body);
-      console.error('[xero publish] invoice create failed:', detail);
-      return NextResponse.json({ error: 'Failed to create Xero invoice', detail }, { status: 502 });
-    }
+    await syncPeriodStatus(id, slices.length);
 
-    const xeroInvoiceId = created.invoiceID;
-    const finalInvoiceNumber = created.invoiceNumber ?? xeroInvoiceId;
-
-    // ── generate and attach PDF report ─────────────────────────────────────────
-
-    let pdfAttached = false;
-    try {
-      const pdfPeriod = {
-        ...period,
-        entries: period.entries.map((e: any) => ({
-          ...e,
-          project: e.project ? { ...e.project, hourlyRate: Number(e.project.hourlyRate) } : null,
-        })),
-      };
-      const pdfBuffer = await generatePeriodPdf(pdfPeriod as any, period.organization?.name);
-      await xero.accountingApi.createInvoiceAttachmentByFileName(
-        tenantId,
-        xeroInvoiceId,
-        'ORA-Time-Report.pdf',
-        pdfBuffer,
-        true,
-      );
-      pdfAttached = true;
-    } catch (pdfErr) {
-      console.error('[xero publish] PDF generation/attachment failed:', pdfErr);
-    }
-
-    // ── update TimePeriod ─────────────────────────────────────────────────────
-
-    await prisma.timePeriod.update({
-      where: { id },
-      data: { status: 'PUBLISHED', publishedAt: new Date(), xeroInvoiceId },
+    const summary = summarise(results, remaining);
+    return NextResponse.json({
+      ok: true,
+      summary,
+      results,
+      remaining,
+      stoppedEarly: remaining.length > 0,
+      message: describeRun(summary, remaining, 'Xero'),
     });
-
-    return NextResponse.json({ ok: true, invoiceId: xeroInvoiceId, invoiceNumber: finalInvoiceNumber, pdfAttached });
   } catch (err) {
     console.error('[periods/publish/xero POST] error:', err);
     const message = err instanceof Error ? err.message : 'Internal server error';
